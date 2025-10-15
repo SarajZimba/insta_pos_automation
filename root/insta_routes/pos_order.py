@@ -340,7 +340,13 @@ def handle_instagram_messages():
                                 order_summary.append(f"{quantity} x {product_name} (Rs {total_price})")
 
                         if order_summary:
-                            summary_text = "✅ Order placed: " + ", ".join(order_summary) + ". Type 'confirm' to confirm the order."
+                            # summary_text = "✅ Order placed: " + ", ".join(order_summary) + ". Type 'confirm' to confirm the order."
+                            summary_text = (
+                                "✅ Order placed: " + ", ".join(order_summary) + 
+                                ".\n\nTo confirm delivery, reply exactly in this format:\n"
+                                "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>\n\n"
+                                "Example:\nCONFIRM | Name: John Doe | Address: Baneshwor, KTM | Phone: 9812345678"
+                            )
                             send_instagram_message(sender_id, summary_text)
                             continue
 
@@ -363,20 +369,61 @@ def handle_instagram_messages():
                         send_instagram_message(sender_id, f"You selected {product_name}. Please enter the quantity:")
                         continue
 
+                # elif intent == "confirm_order":
+                #     orders = get_pending_orders(sender_id)
+                #     if orders:
+                #         total_amount = 0
+                #         summary_lines = []
+
+                #         for order in orders:
+                #             update_order_status(order["id"], "confirmed")
+                #             total_amount += float(order["total_price"])
+                #             summary_lines.append(f"{order['quantity']} x {order['product_name']} (Rs {order['total_price']})")
+
+                #         summary_text = "✅ Order confirmed:\n" + "\n".join(summary_lines) + f"\nTotal: Rs {total_amount}"
+                #         send_instagram_message(sender_id, summary_text)
+                #         continue
+
                 elif intent == "confirm_order":
                     orders = get_pending_orders(sender_id)
-                    if orders:
-                        total_amount = 0
-                        summary_lines = []
+                    if not orders:
+                        send_instagram_message(sender_id, "You have no pending orders to confirm.")
+                        continue
 
+                    customer_details = llama_intent.get("customer_details", {})
+                    name = customer_details.get("name")
+                    address = customer_details.get("address")
+                    phone = customer_details.get("phone")
+
+                    print("name", name)
+                    print("address", address)
+                    print("phone", phone)
+
+                    if not name or not address or not phone:
+                        send_instagram_message(
+                            sender_id,
+                            "Please provide your Name, Address, and Phone in this format:\n"
+                            "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
+                        )
+                        continue
+
+                    # Call delivery API
+                    response, total_amount = create_delivery(orders, customer_details)
+
+                    if response.status_code in [200, 201]:
+                        # Update order status in DB
                         for order in orders:
                             update_order_status(order["id"], "confirmed")
-                            total_amount += float(order["total_price"])
-                            summary_lines.append(f"{order['quantity']} x {order['product_name']} (Rs {order['total_price']})")
 
-                        summary_text = "✅ Order confirmed:\n" + "\n".join(summary_lines) + f"\nTotal: Rs {total_amount}"
-                        send_instagram_message(sender_id, summary_text)
-                        continue
+                        send_instagram_message(
+                            sender_id,
+                            f"✅ Your order has been confirmed and delivery created!\n"
+                            f"Total: Rs {total_amount}\n"
+                            f"Name: {name}, Address: {address}, Phone: {phone}"
+                        )
+                    else:
+                        send_instagram_message(sender_id, "❌ Failed to create delivery. Please try again.")
+                    continue
 
                 elif intent == "cancel_order":
                     order = get_pending_orders(sender_id)
@@ -721,4 +768,64 @@ def get_product_by_name(product_name: str):
         print("⚠️ Error fetching product:", e)
 
     return None
+
+import requests
+import json
+from datetime import datetime
+
+# -------------------- DELIVERY API FUNCTION --------------------
+def create_delivery(orders, customer_details):
+    """
+    Post delivery to the delivery API.
+    orders: list of pending order dicts
+    customer_details: dict with keys name, address, phone
+    """
+    delivery_items = []
+    total_amount = 0
+
+    for order in orders:
+        product_name = order["product_name"].lower()
+        quantity = float(order["quantity"])
+        total_price = float(order["total_price"])
+        total_amount += total_price
+
+        # Match product ID from PRODUCTS dict (fetched previously from API)
+        product_info = next((p for p in PRODUCTS.values() if p["title"].lower() == product_name), None)
+        if not product_info:
+            continue
+
+        delivery_items.append({
+            "product": product_info["id"],
+            "quantity": quantity
+        })
+
+    # Generate bill_no using first order id or timestamp
+    bill_no = f"BIL-{orders[0]['id']}-{int(datetime.now().timestamp())}"
+
+    # Prepare payload
+    payload = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "deliveryDate": (datetime.now()).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "deliver_to": customer_details.get("address"),
+        "special_request": "",
+        "Current_state": "Ordered",
+        "delivery_option": "Express",
+        "bill_no": bill_no,
+        "customer": {
+            "name": customer_details.get("name"),
+            "tax_number": "",
+            "address": customer_details.get("address"),
+            "contact_number": customer_details.get("phone"),
+            "email": "",
+            "branch": None
+        },
+        "delivery_details": delivery_items
+    }
+
+    # Post to API
+    api_url = "https://vibezdc.silverlinepos.com/api/delivery-create/"
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(api_url, headers=headers, json=payload)
+    return response, total_amount
 
