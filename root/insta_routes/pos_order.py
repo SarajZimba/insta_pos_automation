@@ -6,7 +6,17 @@ import mysql.connector
 from insta_routes.convert_to_words import convert_amount_to_words
 from utils.ollama_helper import query_ollama
 
+from helper_func import is_duplicate_message, save_processed_message
+
 load_dotenv()
+
+
+from sentence_transformers import SentenceTransformer, util
+import torch
+
+# Initialize the embedding model (you can choose any model you like)
+embedder = SentenceTransformer('all-MiniLM-L6-v2')  # small and fast
+
 
 instagram_receive = Blueprint("instagram_receive", __name__)
 
@@ -48,6 +58,7 @@ def fetch_products_from_api():
     except Exception as e:
         print("Error fetching products from API:", e)
         return {}
+
     
 import re
 import requests
@@ -127,6 +138,7 @@ def save_message_to_redis(sender_id, question, answer):
 PRODUCTS = {}
 
 import re
+import threading
 
 
 @instagram_receive.route('/instagram_receive', methods=['POST', 'GET'])
@@ -149,6 +161,14 @@ def handle_instagram_messages():
             return "Verification failed", 403
     """Handles incoming Instagram messages"""
     data = request.json
+
+    # ✅ Respond IMMEDIATELY (prevents Instagram retry spam)
+    threading.Thread(target=process_message_async, args=(data,)).start()
+    return "EVENT_RECEIVED", 200
+
+
+
+def process_message_async(data):
     print(data)
     if "entry" in data:
         for entry in data["entry"]:
@@ -158,6 +178,18 @@ def handle_instagram_messages():
                 if message.get("message", {}).get("is_echo"):
                     print("🔁 Skipping echo message...")
                     continue
+
+                if message.get("message", {}).get("mid"):
+                    message_id = message.get("message", {}).get("mid")
+
+                if "attachments" in message.get("message", {}):
+                    for attachment in message["message"]["attachments"]:
+                        if attachment["type"] == "image":
+                            image_url = attachment["payload"]["url"]
+                            from .image import handle_instagram_image
+                            handle_instagram_image(sender_id, image_url)
+                            continue
+
 
                 # Handle postback from carousel buttons
                 if "postback" in message:
@@ -182,9 +214,101 @@ def handle_instagram_messages():
                         product_name = payload.replace("ORDER_", "").replace("_", " ")
                         print(f"User wants to order: {product_name}")
 
-                        # Save order in DB / start order flow
-                        # save_order_to_db(sender_id, product_name)
-                        send_instagram_message(sender_id, f"You selected {product_name}. Please enter the quantity:")
+                        try:
+                            # 1️⃣ Fetch all categories and products from API
+                            category_resp = requests.get(
+                                "https://vibezdc.silverlinepos.com/api/categories/",
+                                timeout=5
+                            )
+                            categories = category_resp.json() if category_resp.status_code == 200 else []
+
+                            # 2️⃣ Find the clicked product
+                            matched_product = None
+                            for cat in categories:
+                                for p in cat.get("products", []):
+                                    if p["title"].lower() == product_name.lower():
+                                        matched_product = p
+                                        break
+                                if matched_product:
+                                    break
+
+                            if not matched_product:
+                                send_instagram_message(sender_id, f"❌ Could not find the product '{product_name}'.")
+                                continue
+
+                            # 3️⃣ Default quantity = 1
+                            quantity = 0
+                            price = float(matched_product["price"])
+                            total_price = price * quantity
+
+                            # 4️⃣ Save order to DB
+                            save_order_to_db_all(sender_id, matched_product["title"], quantity, price, total_price)
+
+                            # 5️⃣ Check if product has attributes
+                            attr_resp = requests.post(
+                                "https://vibezdc.silverlinepos.com/api/products/attributes/name",
+                                json={"product_name": matched_product["title"]},
+                                timeout=5
+                            )
+                            attr_data = attr_resp.json() if attr_resp.status_code == 200 else {}
+                            attributes = attr_data.get("attributes", {})
+
+                            color_options = attributes.get("color", [])
+                            size_options = attributes.get("size", [])
+
+                            # 6️⃣ Ask for attributes if available, else confirm order
+                            if color_options or size_options:
+                                attr_message = f"⚙️ Please specify the missing details for your product {matched_product['title']}:\n\n"
+                                if size_options:
+                                    attr_message += "📏 *Available Sizes:*\n" + "\n".join(f"   - {s}" for s in size_options)
+                                if color_options:
+                                    attr_message += "\n\n🎨 *Available Colors:*\n" + "\n".join(f"   - {c}" for c in color_options)
+                                attr_message += (
+                                    "\n\n📝 *Reply in this format:*\n"
+                                    "👉 `XL Golden, L Blue, XXL Red`\n\n"
+                                    "Each item should include size and color if applicable."
+                                )
+                                send_instagram_message(sender_id, attr_message)
+
+                            else:
+                                connection = get_db_connection()
+                                cursor = connection.cursor(dictionary=True)
+                                # ✅ No attributes → now check for quantity requirement
+                                cursor.execute("""
+                                    SELECT id, product_name FROM orders
+                                    WHERE sender_id = %s AND status='pending' AND quantity=0
+                                    ORDER BY id ASC LIMIT 1
+                                """, (sender_id,))
+                                pending_qty = cursor.fetchone()
+
+                                cursor.close()
+                                connection.close()
+
+                                if pending_qty:
+                                    # Ask quantity for only the FIRST pending product
+                                    send_instagram_message(
+                                        sender_id,
+                                        f"📝 Please enter quantity for: *{pending_qty['product_name']}*\n"
+                                        "Reply with a number like:\n"
+                                        "👉 1, 2, 3, four, ten"
+                                    )
+                                else:
+                                    # If quantity is already known → proceed to confirmation
+                                    send_instagram_message(
+                                        sender_id,
+                                        f"✅ Added {quantity} x {matched_product['title']} (Rs {price} each).\n"
+                                        f"Total: Rs {total_price}\n\n"
+                                        "🎉 All items ready!\n"
+                                        "To confirm delivery, reply confirm in this format:\n"
+                                        "confirm"
+                                    )
+
+                                
+
+                        except Exception as e:
+                            print("⚠️ Failed to process quick reply order:", e)
+                            send_instagram_message(sender_id, "❌ Something went wrong while processing your order. Please try again.")
+
 
                     # ---------- CATEGORY SELECTION ----------
                     elif payload.startswith("CATEGORY_"):
@@ -226,25 +350,113 @@ def handle_instagram_messages():
                 if not text:
                     continue
 
+                # Check if sender_id has an ongoing confirm_order flow
+                state_json = r.get(f"confirm_order:{sender_id}")
+                if state_json:
+                    state = json.loads(state_json)
+                    step = state["step"]
+
+                    if step == "asking_name":
+                        state["customer_details"]["name"] = text
+                        state["step"] = "asking_address"
+                        r.set(f"confirm_order:{sender_id}", json.dumps(state))
+                        send_instagram_message(sender_id, "Thanks! Now please provide your delivery address.")
+                        continue
+
+                    elif step == "asking_address":
+                        state["customer_details"]["address"] = text
+                        state["step"] = "asking_phone"
+                        r.set(f"confirm_order:{sender_id}", json.dumps(state))
+                        send_instagram_message(sender_id, "Almost done! Please provide your phone number.")
+                        continue
+
+                    elif step == "asking_phone":
+                        state["customer_details"]["phone"] = text
+                        state["step"] = "confirming_order"
+                        r.set(f"confirm_order:{sender_id}", json.dumps(state))
+
+                        details = state["customer_details"]
+                        send_instagram_message(
+                            sender_id,
+                            f"✅ Order Details:\n"
+                            f"Name: {details['name']}\n"
+                            f"Address: {details['address']}\n"
+                            f"Phone: {details['phone']}\n\n"
+                            # f"Reply 'yes' to confirm or 'no' to cancel."
+                            f"Reply 'yes' to confirm"
+                        )
+                        continue
+
+                    elif step == "confirming_order":
+                        if text.lower() == "yes":
+                            details = state["customer_details"]
+                            orders = state["orders"]
+                            response, total_amount = create_delivery(orders, details)
+                            if response.status_code in [200, 201]:
+                                for order in orders:
+                                    update_order_status(order["id"], "confirmed")
+                                send_instagram_message(
+                                    sender_id,
+                                    f"🎉 Your order has been confirmed!\n"
+                                    f"Total: Rs {total_amount}\n"
+                                    f"Name: {details['name']}, Address: {details['address']}, Phone: {details['phone']}"
+                                )
+                            else:
+                                send_instagram_message(sender_id, "❌ Failed to create delivery. Please try again.")
+                        else:
+                            send_instagram_message(sender_id, "❌ Order cancelled.")
+
+                        # Clear Redis state after confirmation or cancellation
+                        r.delete(f"confirm_order:{sender_id}")
+                        continue
+
+
                 text_lower = text.lower()
                 negative_intent = contains_pattern(text_lower, NEGATIVE_PATTERNS)
 
                 if negative_intent:
                     continue
 
-                greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-
+                greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "yes"]
+                num = is_number_only(text)
                 context = ""
                 if text_lower in greetings:
-                    llama_intent = {"intent": "small_talk", "category_filter": None, "product_name": None, "negative_intent": False}
+                    intent = "show_products"
+                    llama_intent = {"intent": "show_products", "category_filter": None, "product_name": None, "negative_intent": False}
+                
+                elif text_lower == "confirm":
+                    intent = "confirm_order"
+                    llama_intent = {"intent": "confirm_order", "negative_intent": False}
+                elif num is not None:
+                    # Force intent = place_quantity without asking Ollama
+                    llama_intent = {
+                        "intent": "place_quantity",
+                        "category_filter": None,
+                        "order_items": [
+                            {"product": None, "quantity": num, "color": None, "size": None,
+                            "gender": None, "style": None, "season": None, "fit": None,
+                            "missing_slots": []}
+                        ],
+                        "customer_details": {"name": None, "address": None, "phone": None},
+                        "negative_intent": False
+                    }
+                    intent = "place_quantity"
                 else:
                     llama_intent_raw = query_ollama(text, context)
                     llama_intent = llama_intent_raw
                     # llama_intent = json.loads(llama_intent_raw)
+                    intent = "could not understand"
+
+                if not is_duplicate_message(sender_id, message_id, intent):
+                    save_processed_message(sender_id, message_id, intent)
+                else:
+                    print(f"Skipping duplicate message: {message_id}")
 
         
 
                 intent = llama_intent.get("intent", "none")
+                # --- Mark this message as processed ---
+                # save_processed_message(sender_id, message_id, intent)
                 category_filter = llama_intent.get("category_filter")
                 negative_intent = llama_intent.get("negative_intent", False)
                 product_name = llama_intent.get("product_name")
@@ -257,6 +469,8 @@ def handle_instagram_messages():
                 # --- Fetch all categories ---
                 resp = requests.get("https://vibezdc.silverlinepos.com/api/categories/", timeout=5)
                 all_categories = resp.json() if resp.status_code == 200 else []
+
+                print("api called")
 
                 if intent == "small_talk":
                     send_instagram_message(sender_id, "Hello! Would you like to view our products for order?")
@@ -309,148 +523,101 @@ def handle_instagram_messages():
                         send_instagram_message(sender_id, f"Category '{category_filter}' not found.")
                         continue
 
-                # elif intent == "place_order":
-                #     order_items = llama_intent.get("order_items", [])
-
-                #     # ✅ If LLM detected multiple items
-                #     if order_items and len(order_items) > 0:
-                #         order_summary = []  # to prepare a reply like "Added 3 burgers, 2 pizzas..."
-
-                #         for item in order_items:
-                #             product_name = item.get("product")
-                #             quantity = item.get("quantity")
-                #             color = item.get("color")
-                #             size = item.get("size")
-                #             gender = item.get("gender")
-                #             style = item.get("style")
-                #             season = item.get("season")
-                #             fit = item.get("fit")
-                #             missing_slots = item.get("missing_slots")
-
-                #             print("product_name", product_name)
-                #             print("quantity", quantity)
-                #             print("color", color)
-                #             print("size", size)
-                #             print("gender", gender)
-                #             print("style", style)
-                #             print("season", season)
-                #             print("fit", fit)
-                #             print("missing_slots", missing_slots)
-
-                #             if not product_name or not quantity:
-                #                 continue  # skip incomplete entries
-
-                #             product_key = product_name.lower()
-
-                #             if product_key in PRODUCTS:
-                #                 total_price = float(PRODUCTS[product_key]["price"]) * int(quantity)
-                #                 # save_order_to_db_all(sender_id, product_name, quantity, total_price)
-                #                 save_order_to_db_all(sender_id, product_name, quantity, total_price, color, size, gender, style, season, fit)
-                #                 order_summary.append(f"{quantity} x {product_name} (Rs {total_price})")
-
-                #         if order_summary:
-                #             # summary_text = "✅ Order placed: " + ", ".join(order_summary) + ". Type 'confirm' to confirm the order."
-                #             summary_text = (
-                #                 "✅ Order placed: " + ", ".join(order_summary) + 
-                #                 ".\n\nTo confirm delivery, reply exactly in this format:\n"
-                #                 "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>\n\n"
-                #                 "Example:\nCONFIRM | Name: John Doe | Address: Baneshwor, KTM | Phone: 9812345678"
-                #             )
-                #             send_instagram_message(sender_id, summary_text)
-                #             continue
-
-                # elif intent == "place_order":
-                #     order_items = llama_intent.get("order_items", [])
-                #     if order_items and len(order_items) > 0:
-                #         for item in order_items:
-                #             product_name = item.get("product")
-                #             quantity = item.get("quantity")
-                #             ...
-                #             if not product_name or not quantity:
-                #                 continue
-
-                #             # 🔹 Check product attributes from API
-                #             try:
-                #                 resp = requests.post(
-                #                     "https://vibezdc.silverlinepos.com/api/products/attributes/name",
-                #                     json={"product_name": product_name},
-                #                     timeout=5
-                #                 )
-                #                 attr_data = resp.json() if resp.status_code == 200 else {}
-                #                 attributes = attr_data.get("attributes", {})
-
-                #                 color_options = attributes.get("color", [])
-                #                 size_options = attributes.get("size", [])
-
-                #                 # Save minimal order first (without color/size)
-                #                 # total_price = float(PRODUCTS[product_name.lower()]["price"]) * int(quantity)
-                #                 total_price = 0
-                #                 save_order_to_db_all(sender_id, product_name, quantity, total_price)
-
-                #                 # 🔸 Ask for attribute if required
-                #                 if color_options or size_options:
-                #                     attr_message = "Please specify "
-
-                #                     if size_options:
-                #                         attr_message += f"size ({', '.join(size_options)})"
-                #                     if color_options:
-                #                         attr_message += f" and color ({', '.join(color_options)})"
-
-                #                     attr_message += f" in this format: I want attribute for {product_name}  of SIZE (e.g., L) and COLOR  (Golden)"
-                #                     send_instagram_message(sender_id, attr_message)
-                #                     continue  # wait for attribute response
-
-                #                 else:
-                #                     # directly ask for confirmation
-                #                     send_instagram_message(
-                #                         sender_id,
-                #                         f"✅ Added {quantity} x {product_name}.\n"
-                #                         "To confirm delivery, reply exactly in this format:\n"
-                #                         "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
-                #                     )
-
-                #             except Exception as e:
-                #                 print("⚠️ Attribute fetch failed:", e)
-                #                 send_instagram_message(sender_id, f"Order received for {product_name}, but unable to fetch attributes. {str(e)}")
-                #                 continue
                 elif intent == "place_order":
+                    print("inside place order")
                     order_items = llama_intent.get("order_items", [])
+
+                    print("order items", order_items)
                     if order_items and len(order_items) > 0:
-                        for item in order_items:
-                            product_name = item.get("product")
-                            quantity = item.get("quantity")
+                        try:
+                            # 🔹 Fetch all categories and their products
+                            category_resp = requests.get(
+                                "https://vibezdc.silverlinepos.com/api/categories/",
+                                timeout=5
+                            )
+                            categories = category_resp.json() if category_resp.status_code == 200 else []
 
-                            if not product_name or not quantity:
-                                continue
+                            print("categories fteched")
 
-                            try:
-                                # 🔹 Fetch all categories and their products
-                                category_resp = requests.get(
-                                    "https://vibezdc.silverlinepos.com/api/categories/",
-                                    timeout=5
-                                )
-                                if category_resp.status_code == 200:
-                                    categories = category_resp.json()
-                                else:
-                                    categories = []
+                            print("len", len(order_items))
+                            #   Flatten products into dict and list for embeddings
+                            PRODUCTS_LOOKUP = {}
+                            PRODUCTS_LIST = []
+                            for cat in categories:
+                                for p in cat.get("products", []):
+                                    PRODUCTS_LIST.append(p["title"])
+                                    PRODUCTS_LOOKUP[p["title"]] = p
+                            print("products lookup", PRODUCTS_LOOKUP)
+                            print("products list",PRODUCTS_LIST)
+                            # Create embeddings for all products (you can cache this for performance)
+                            PRODUCT_EMBEDS = embedder.encode(PRODUCTS_LIST, convert_to_tensor=True)
 
-                                matched_product = None
-                                for category in categories:
-                                    for product in category.get("products", []):
-                                        if product_name.lower() == product["title"].lower():
-                                            matched_product = product
-                                            break
-                                    if matched_product:
-                                        break
+                            for item in order_items:
+                                product_name_input = item.get("product")
+                                print("product name input", product_name_input)
+                                quantity = item.get("quantity", 0)
 
-                                if matched_product:
-                                    price = float(matched_product["price"])
-                                    total_price = price * int(quantity)
-                                else:
-                                    total_price = 0  # fallback if not found
+                                if quantity == None:
+                                    # quantity = 1
+                                    quantity = 0
+                                print("quantity", quantity)
+                                # if not product_name_input or not quantity:
+                                #     continue
+                                if not product_name_input:
+                                    continue
 
-                                # Save order (with calculated total_price)
-                                save_order_to_db_all(sender_id, product_name, quantity, total_price)
+                                # 🔹 Embed user input
+                                user_embed = embedder.encode(product_name_input, convert_to_tensor=True)
+
+                                # 🔹 Find closest product using cosine similarity
+                                cos_scores = util.cos_sim(user_embed, PRODUCT_EMBEDS)[0]
+                                best_idx = torch.argmax(cos_scores).item()
+                                similarity = cos_scores[best_idx].item()
+                                matched_product_name = PRODUCTS_LIST[best_idx]
+
+                                print("matched_product name before", matched_product_name)
+
+
+                                # matched_product_name, similarity = find_closest_product_faiss(product_name_input)
+                                print("similarity", similarity)
+                                                                
+                                if similarity < 0.98:
+                                    # Find top N similar products (not just the best one)
+                                    cos_scores_list = cos_scores.tolist()
+                                    top_indices = sorted(range(len(cos_scores_list)), key=lambda i: cos_scores_list[i], reverse=True)[:5]
+
+                                    quick_replies = []
+                                    for idx in top_indices:
+                                        candidate_name = PRODUCTS_LIST[idx]
+                                        quick_replies.append({
+                                            "content_type": "text",
+                                            "title": candidate_name[:20],  # max 20 chars for Instagram
+                                            "payload": f"PRODUCT_{candidate_name.upper().replace(' ', '_')}"
+                                        })
+
+                                    payload = {
+                                        "recipient": {"id": sender_id},
+                                        "message": {
+                                            "text": f"🤔 We found multiple products similar to '{product_name_input}'. Please choose one:",
+                                            "quick_replies": quick_replies
+                                        }
+                                    }
+
+                                    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+                                    requests.post(GRAPH_API_URL, headers=headers, json=payload)
+                                    continue  # skip further processing until user selects a product
+
+                                print("matched_product name after", matched_product_name)
+                                matched_product = PRODUCTS_LOOKUP[matched_product_name]
+
+                                # 🔹 Calculate total price
+                                price = float(matched_product["price"])
+                                total_price = price * int(quantity)
+
+                                # 🔹 Save order
+                                save_order_to_db_all(sender_id, matched_product["title"], quantity, price, total_price)
+
+                                # 🔹 Fetch pending order to check attributes
                                 connection = get_db_connection()
                                 cursor = connection.cursor(dictionary=True)
                                 cursor.execute("""
@@ -459,10 +626,7 @@ def handle_instagram_messages():
                                     ORDER BY id ASC LIMIT 1
                                 """, (sender_id,))
                                 pending_order = cursor.fetchone()
-
-                                if pending_order:
-                                    # Fetch product name from pending order
-                                    pending_product_name = pending_order["product_name"]
+                                pending_product_name = pending_order["product_name"] if pending_order else matched_product_name
 
                                 # 🔹 Fetch product attributes if any
                                 attr_resp = requests.post(
@@ -476,169 +640,115 @@ def handle_instagram_messages():
                                 color_options = attributes.get("color", [])
                                 size_options = attributes.get("size", [])
 
-
-
-
-
-                                # if color_options or size_options:
-                                #     attr_message = "Please specify "
-                                #     if size_options:
-                                #         attr_message += f"size ({', '.join(size_options)})"
-                                #     if color_options:
-                                #         attr_message += f" and color ({', '.join(color_options)})"
-                                #     attr_message += f" in this format: e.g. (XL Golden, L Blue, XXL Red)"
-                                #     send_instagram_message(sender_id, attr_message)
-                                #     continue
-
                                 if color_options or size_options:
-                                    # 🧾 Build a clean message
                                     attr_message = f"⚙️ Please specify the missing details for your product {pending_product_name}:\n\n"
-
                                     if size_options:
-                                        attr_message += "📏 *Available Sizes:*\n"
-                                        for size in size_options:
-                                            attr_message += f"   - {size}\n"
-
+                                        attr_message += "📏 *Available Sizes:*\n" + "\n".join(f"   - {s}" for s in size_options)
                                     if color_options:
-                                        attr_message += "\n🎨 *Available Colors:*\n"
-                                        for color in color_options:
-                                            attr_message += f"   - {color}\n"
-
+                                        attr_message += "\n\n🎨 *Available Colors:*\n" + "\n".join(f"   - {c}" for c in color_options)
                                     attr_message += (
-                                        "\n📝 *Reply in this format:*\n"
+                                        "\n\n📝 *Reply in this format:*\n"
                                         "👉 `XL Golden, L Blue, XXL Red`\n\n"
                                         "Each item should include size and color if applicable."
                                     )
-
                                     send_instagram_message(sender_id, attr_message)
-                                    continue
-
 
                                 else:
-                                    send_instagram_message(
-                                        sender_id,
-                                        f"✅ Added {quantity} x {product_name} (Rs {price} each).\n"
-                                        f"Total: Rs {total_price}\n"
-                                        "To confirm delivery, reply exactly in this format:\n"
-                                        "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
-                                    )
-                                    continue
-                            except Exception as e:
-                                print("⚠️ Price fetch or attribute fetch failed:", e)
-                                send_instagram_message(sender_id, f"Order received for {pending_product_name}, but price or attributes could not be fetched.")
-                                continue
+                                    # ✅ No attributes → now check for quantity requirement
+                                    cursor.execute("""
+                                        SELECT id, product_name FROM orders
+                                        WHERE sender_id = %s AND status='pending' AND quantity=0
+                                        ORDER BY id ASC LIMIT 1
+                                    """, (sender_id,))
+                                    pending_qty = cursor.fetchone()
+
+                                    cursor.close()
+                                    connection.close()
+
+                                    if pending_qty:
+                                        # Ask quantity for only the FIRST pending product
+                                        send_instagram_message(
+                                            sender_id,
+                                            f"📝 Please enter quantity for: *{pending_qty['product_name']}*\n"
+                                            "Reply with a number like:\n"
+                                            "👉 1, 2, 3, four, ten"
+                                        )
+                                    else:
+                                        # If quantity is already known → proceed to confirmation
+                                        send_instagram_message(
+                                            sender_id,
+                                            f"✅ Added {quantity} x {matched_product['title']} (Rs {price} each).\n"
+                                            f"Total: Rs {total_price}\n\n"
+                                            "🎉 All items ready!\n"
+                                            "To confirm delivery, reply 'confirm' exactly in this format:\n"
+                                            "confirm"
+                                        )
+
+                        except Exception as e:
+                            print("⚠️ Order processing failed:", e)
+                            send_instagram_message(sender_id, "❌ Something went wrong while processing your order. Please try again.")
 
 
-                # elif intent == "add_attribute":
-                #     order_items = llama_intent.get("order_items", [])
-                #     print("addd_attribute order items", order_items)
-                #     sender = sender_id
+                elif intent == "place_quantity":
+                    print("got inside place quantity")
+                    order_items = llama_intent.get("order_items", [])
+                    sender = sender_id
 
-                #     if order_items:
-                #         connection = get_db_connection()
-                #         cursor = connection.cursor(dictionary=True)
+                    if order_items:
+                        qty = order_items[0]["quantity"]
+                        print("quantity from place quantity intent", qty)
 
-                #         # Find the oldest order that still needs attributes
-                #         cursor.execute("""
-                #             SELECT id, product_name FROM orders
-                #             WHERE sender_id = %s AND status = 'pending' AND attributes_filled = FALSE
-                #             ORDER BY id ASC LIMIT 1
-                #         """, (sender,))
-                #         current_order = cursor.fetchone()
+                        connection = get_db_connection()
+                        cursor = connection.cursor(dictionary=True)
 
-                #         if current_order:
-                #             item = order_items[0]  # Take first product’s attributes
-                #             color = item.get("color")
-                #             size = item.get("size")
+                        # Find the first pending product with missing quantity
+                        cursor.execute("""
+                            SELECT id, product_name FROM orders
+                            WHERE sender_id = %s AND status='pending' AND quantity=0
+                            ORDER BY id ASC LIMIT 1
+                        """, (sender,))
+                        pending_order = cursor.fetchone()
 
-                #             cursor.execute("""
-                #                 UPDATE orders
-                #                 SET color=%s, size=%s, attributes_filled=TRUE
-                #                 WHERE id=%s
-                #             """, (color, size, current_order["id"]))
-                #             connection.commit()
+                        if pending_order:
+                            # Get price
+                            cursor.execute("SELECT price FROM orders WHERE id=%s", (pending_order["id"],))
+                            row = cursor.fetchone()
+                            price = float(row["price"])
 
-                #             # ✅ Check for next product needing attributes
-                #             cursor.execute("""
-                #                 SELECT id, product_name FROM orders
-                #                 WHERE sender_id = %s AND status='pending' AND attributes_filled=FALSE
-                #                 ORDER BY id ASC LIMIT 1
-                #             """, (sender,))
-                #             next_order = cursor.fetchone()
+                            # Calculate total
+                            total_price = price * qty
 
-                #             if next_order:
-                #                 next_product_name = next_order["product_name"]
+                            # Update both quantity and total_price
+                            cursor.execute("""
+                                UPDATE orders SET quantity=%s, total_price=%s WHERE id=%s
+                            """, (qty, total_price, pending_order["id"]))
+                            connection.commit()
 
-                #                 try:
-                #                     # 🔹 Fetch product attributes like in 'place_order'
-                #                     attr_resp = requests.post(
-                #                         "https://vibezdc.silverlinepos.com/api/products/attributes/name",
-                #                         json={"product_name": next_product_name},
-                #                         timeout=5
-                #                     )
-                #                     attr_data = attr_resp.json() if attr_resp.status_code == 200 else {}
-                #                     attributes = attr_data.get("attributes", {})
+                            # Check if another item still needs quantity
+                            cursor.execute("""
+                                SELECT id, product_name FROM orders
+                                WHERE sender_id = %s AND status='pending' AND quantity=0
+                                ORDER BY id ASC LIMIT 1
+                            """, (sender,))
+                            next_pending = cursor.fetchone()
 
-                #                     color_options = attributes.get("color", [])
-                #                     size_options = attributes.get("size", [])
+                            if next_pending:
+                                send_instagram_message(
+                                    sender_id,
+                                    f"✅ Quantity set for {pending_order['product_name']}.\n"
+                                    f"📝 Now, enter quantity for: *{next_pending['product_name']}*"
+                                )
+                            else:
+                                send_instagram_message(
+                                    sender_id,
+                                    "✅ All quantities are set!\n"
+                                    "🎉 Your order is ready.\n"
+                                    "Confirm using:\n"
+                                    "confirm"
+                                )
 
-                #                     if color_options or size_options:
-                #                         attr_message = (
-                #                             f"✅ Updated attributes for {current_order['product_name']}.\n\n"
-                #                             f"⚙️ Now, please specify the missing details for your next product: "
-                #                             f"*{next_product_name}*\n\n"
-                #                         )
-
-                #                         if size_options:
-                #                             attr_message += "📏 *Available Sizes:*\n"
-                #                             for size in size_options:
-                #                                 attr_message += f"   - {size}\n"
-
-                #                         if color_options:
-                #                             attr_message += "\n🎨 *Available Colors:*\n"
-                #                             for color in color_options:
-                #                                 attr_message += f"   - {color}\n"
-
-                #                         attr_message += (
-                #                             "\n📝 *Reply in this format:*\n"
-                #                             "👉 `XL Golden, L Blue, XXL Red`\n\n"
-                #                             "Each item should include size and color if applicable."
-                #                         )
-
-                #                         send_instagram_message(sender_id, attr_message)
-
-                #                     else:
-                #                         # No attributes found
-                #                         send_instagram_message(
-                #                             sender_id,
-                #                             f"✅ Updated attributes for {current_order['product_name']}.\n"
-                #                             f"Next product: {next_product_name} has no size/color options.\n"
-                #                             "Please confirm your order using:\n"
-                #                             "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
-                #                         )
-
-                #                 except Exception as e:
-                #                     print("⚠️ Attribute fetch failed:", e)
-                #                     send_instagram_message(
-                #                         sender_id,
-                #                         f"✅ Updated attributes for {current_order['product_name']}.\n"
-                #                         f"Couldn't fetch attributes for {next_product_name}. Please specify manually."
-                #                     )
-
-                #             else:
-                #                 # ✅ No more pending items
-                #                 send_instagram_message(
-                #                     sender_id,
-                #                     f"✅ Attributes updated for {current_order['product_name']}.\n"
-                #                     "🎉 All items are ready! Please confirm your order using:\n"
-                #                     "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
-                #                 )
-                #         else:
-                #             send_instagram_message(sender_id, "No pending order found needing attributes.")
-
-                #         cursor.close()
-                #         connection.close()
-
+                        cursor.close()
+                        connection.close()
 
                 elif intent == "add_attribute":
                     order_items = llama_intent.get("order_items", [])
@@ -648,6 +758,18 @@ def handle_instagram_messages():
                     if order_items:
                         connection = get_db_connection()
                         cursor = connection.cursor(dictionary=True)
+
+                        # Step 0: Check if negative sales is allowed
+                        try:
+                            negative_sales_resp = requests.get(
+                                "https://vibezdc.silverlinepos.com/api/allow-negative-sales/",
+                                timeout=5
+                            )
+                            negative_sales_data = negative_sales_resp.json() if negative_sales_resp.status_code == 200 else {}
+                            allow_negative_sales = negative_sales_data.get("allow_negative_sales", False)
+                        except Exception as e:
+                            print("⚠️ Failed to fetch negative sales flag:", e)
+                            allow_negative_sales = False
 
                         # Find the oldest order that still needs attributes
                         cursor.execute("""
@@ -662,7 +784,7 @@ def handle_instagram_messages():
                             color = item.get("color")
                             size = item.get("size")
 
-                            # ✅ Step 1: Check stock for the chosen variant
+                            # Step 1: Check stock for the chosen variant
                             try:
                                 stock_resp = requests.post(
                                     "https://vibezdc.silverlinepos.com/api/products/stockbyname/",
@@ -682,8 +804,8 @@ def handle_instagram_messages():
                                 stock_qty = stock_data.get("stock_quantity", 0)
                                 available_price = stock_data.get("price", 0)
 
-                                # ✅ Step 2: Check stock availability
-                                if stock_qty <= 0:
+                                # Step 2: Check stock availability or allow negative sales
+                                if stock_qty <= 0 and not allow_negative_sales:
                                     send_instagram_message(
                                         sender_id,
                                         f"❌ Sorry, {current_order['product_name']} ({size}, {color}) is currently out of stock."
@@ -692,7 +814,7 @@ def handle_instagram_messages():
                                     connection.close()
                                     continue
 
-                                elif stock_qty < (current_order.get("quantity") or 1):
+                                elif stock_qty < (current_order.get("quantity") or 1) and not allow_negative_sales:
                                     send_instagram_message(
                                         sender_id,
                                         f"⚠️ Sorry, only {stock_qty} left in stock for {current_order['product_name']} ({size}, {color})."
@@ -701,7 +823,7 @@ def handle_instagram_messages():
                                     connection.close()
                                     continue
 
-                                # ✅ Step 3: Stock available → update the order
+                                # Step 3: Stock available (or negative sales allowed) → update the order
                                 cursor.execute("""
                                     UPDATE orders
                                     SET color=%s, size=%s, attributes_filled=TRUE
@@ -716,7 +838,7 @@ def handle_instagram_messages():
                                 connection.close()
                                 continue
 
-                            # ✅ Step 4: Check for next pending item (your existing logic continues)
+                            # Step 4: Check for next pending item
                             cursor.execute("""
                                 SELECT id, product_name FROM orders
                                 WHERE sender_id = %s AND status='pending' AND attributes_filled=FALSE
@@ -728,7 +850,7 @@ def handle_instagram_messages():
                                 next_product_name = next_order["product_name"]
 
                                 try:
-                                    # 🔹 Fetch next product’s available attributes
+                                    # Fetch next product’s available attributes
                                     attr_resp = requests.post(
                                         "https://vibezdc.silverlinepos.com/api/products/attributes/name",
                                         json={"product_name": next_product_name},
@@ -748,13 +870,13 @@ def handle_instagram_messages():
 
                                         if size_options:
                                             attr_message += "📏 *Available Sizes:*\n"
-                                            for size in size_options:
-                                                attr_message += f"   - {size}\n"
+                                            for s in size_options:
+                                                attr_message += f"   - {s}\n"
 
                                         if color_options:
                                             attr_message += "\n🎨 *Available Colors:*\n"
-                                            for color in color_options:
-                                                attr_message += f"   - {color}\n"
+                                            for c in color_options:
+                                                attr_message += f"   - {c}\n"
 
                                         attr_message += (
                                             "\n📝 *Reply in this format:*\n"
@@ -765,36 +887,151 @@ def handle_instagram_messages():
                                         send_instagram_message(sender_id, attr_message)
                                         continue
                                     else:
-                                        send_instagram_message(
-                                            sender_id,
-                                            f"✅ Updated attributes for {current_order['product_name']}.\n"
-                                            f"Next product: {next_product_name} has no size/color options.\n"
-                                            "Please confirm your order using:\n"
-                                            "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
-                                        )
+
+                                        cursor.execute("""
+                                            SELECT id, product_name FROM orders
+                                            WHERE sender_id = %s AND status='pending' AND quantity=0
+                                            ORDER BY id ASC LIMIT 1
+                                        """, (sender,))
+                                        pending_order = cursor.fetchone()
+
+                                        if pending_order:
+                                            # Prepare a message listing all products with missing quantity
+                                            send_instagram_message(
+                                                sender_id,
+                                                f"✅ Updated attributes for {current_order['product_name']}.\n"
+                                                f"Next product: {next_product_name} has no size/color options.\n"
+                                                f"Please enter the quantities for the following products:\n{pending_order['product_name']}\n\n"
+                                                "Reply in this format:\n"
+                                                "👉 1 , 2, one , two"
+                                            )
+                                        else:
+                                            # If all quantities are already set, proceed with confirmation
+                                            send_instagram_message(
+                                                f"✅ Updated attributes for {current_order['product_name']}.\n"
+                                                f"Next product: {next_product_name} has no size/color options.\n"
+                                                "🎉 Your order is ready! Please confirm using:\n"
+                                                "confirm"
+                                            )
+                                        # send_instagram_message(
+                                        #     sender_id,
+                                        #     f"✅ Updated attributes for {current_order['product_name']}.\n"
+                                        #     f"Next product: {next_product_name} has no size/color options.\n"
+                                        #     "Please confirm your order using:\n"
+                                        #     "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
+                                        # )
                                         continue
                                 except Exception as e:
                                     print("⚠️ Attribute fetch failed:", e)
-                                    send_instagram_message(
-                                        sender_id,
-                                        f"✅ Updated attributes for {current_order['product_name']}.\n"
-                                        f"Couldn't fetch attributes for {next_product_name}. Please specify manually."
-                                    )
+
+                                    cursor.execute("""
+                                        SELECT id, product_name FROM orders
+                                        WHERE sender_id = %s AND status='pending' AND quantity=0 ORDER BY id ASC LIMIT 1
+                                    """, (sender,))
+                                    pending_order = cursor.fetchone()
+
+                                    if pending_order:
+                                        # Prepare a message listing all products with missing quantity
+                                        send_instagram_message(
+                                            sender_id,
+                                            f"✅ Updated attributes for {current_order['product_name']}.\n"
+                                            f"Couldn't fetch attributes for {next_product_name}."
+                                            f"Please enter the quantities for the following products:\n{pending_order['product_name']}\n\n"
+                                            "Reply in this format:\n"
+                                            "👉 1 , 2, one , two"
+                                        )
+                                    else:
+                                        # If all quantities are already set, proceed with confirmation
+                                        send_instagram_message(
+                                            sender_id,
+                                            f"✅ Updated attributes for {current_order['product_name']}.\n"
+                                            f"Couldn't fetch attributes for {next_product_name}."
+                                            "🎉 Your order is ready! Please confirm using:\n"
+                                            "confirm"
+                                        )
+                                    # send_instagram_message(
+                                    #     sender_id,
+                                    #     f"✅ Updated attributes for {current_order['product_name']}.\n"
+                                    #     f"Couldn't fetch attributes for {next_product_name}. Please specify manually."
+                                    # )
+        
                                     continue
                             else:
-                                send_instagram_message(
-                                    sender_id,
-                                    f"✅ Attributes updated for {current_order['product_name']}.\n"
-                                    "🎉 All items are ready! Please confirm your order using:\n"
-                                    "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
-                                )
+
+                                cursor.execute("""
+                                    SELECT id, product_name FROM orders
+                                    WHERE sender_id = %s AND status='pending' AND quantity=0 ORDER BY id ASC LIMIT 1
+                                """, (sender,))
+                                pending_order = cursor.fetchone()
+
+                                if pending_order:
+                                    # Prepare a message listing all products with missing quantity
+                                    send_instagram_message(
+                                        sender_id,
+                                        f"✅ All attributes have been updated.\n\n"
+                                        f"Please enter the quantities for the following products:\n{pending_order['product_name']}\n\n"
+                                        "Reply in this format:\n"
+                                        "👉 1 , 2, one , two"
+                                    )
+                                else:
+                                    # If all quantities are already set, proceed with confirmation
+                                    send_instagram_message(
+                                        sender_id,
+                                        "✅ All attributes and quantities are set.\n"
+                                        "🎉 Your order is ready! Please confirm using:\n"
+                                        "confirm"
+                                    )
+                                # send_instagram_message(
+                                #     sender_id,
+                                #     f"✅ Attributes updated for {current_order['product_name']}.\n"
+                                #     "🎉 All items are ready! Please confirm your order using:\n"
+                                #     "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
+                                # )
                                 continue
                         else:
                             send_instagram_message(sender_id, "No pending order found needing attributes.")
                             continue
-                        cursor.close()
-                        connection.close()
 
+                # elif intent == "confirm_order":
+                #     orders = get_pending_orders(sender_id)
+                #     if not orders:
+                #         send_instagram_message(sender_id, "You have no pending orders to confirm.")
+                #         continue
+
+                #     customer_details = llama_intent.get("customer_details", {})
+                #     name = customer_details.get("name")
+                #     address = customer_details.get("address")
+                #     phone = customer_details.get("phone")
+
+                #     print("name", name)
+                #     print("address", address)
+                #     print("phone", phone)
+
+                #     if not name or not phone:
+                #         send_instagram_message(
+                #             sender_id,
+                #             "Please provide your Name, Address, and Phone in this format:\n"
+                #             "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
+                #         )
+                #         continue
+
+                #     # Call delivery API
+                #     response, total_amount = create_delivery(orders, customer_details)
+
+                #     if response.status_code in [200, 201]:
+                #         # Update order status in DB
+                #         for order in orders:
+                #             update_order_status(order["id"], "confirmed")
+
+                #         send_instagram_message(
+                #             sender_id,
+                #             f"✅ Your order has been confirmed and delivery created!\n"
+                #             f"Total: Rs {total_amount}\n"
+                #             f"Name: {name}, Address: {address}, Phone: {phone}"
+                #         )
+                #     else:
+                #         send_instagram_message(sender_id, "❌ Failed to create delivery. Please try again.")
+                #     continue
 
                 elif intent == "confirm_order":
                     orders = get_pending_orders(sender_id)
@@ -802,40 +1039,20 @@ def handle_instagram_messages():
                         send_instagram_message(sender_id, "You have no pending orders to confirm.")
                         continue
 
-                    customer_details = llama_intent.get("customer_details", {})
-                    name = customer_details.get("name")
-                    address = customer_details.get("address")
-                    phone = customer_details.get("phone")
-
-                    print("name", name)
-                    print("address", address)
-                    print("phone", phone)
-
-                    if not name or not address or not phone:
-                        send_instagram_message(
-                            sender_id,
-                            "Please provide your Name, Address, and Phone in this format:\n"
-                            "CONFIRM | Name: <Your Name> | Address: <Your Address> | Phone: <98xxxxxxxx>"
-                        )
+                    # Check if the user already has a state in Redis
+                    state_json = r.get(f"confirm_order:{sender_id}")
+                    if not state_json:
+                        # Initialize multi-step flow in Redis
+                        state = {
+                            "step": "asking_name",
+                            "customer_details": {"name": None, "address": None, "phone": None},
+                            "orders": orders
+                        }
+                        # ✅ Use custom converter to handle Decimal
+                        r.set(f"confirm_order:{sender_id}", json.dumps(state, default=decimal_default))
+                        send_instagram_message(sender_id, "Sure! Let's confirm your order. Please tell me your full name.")
                         continue
 
-                    # Call delivery API
-                    response, total_amount = create_delivery(orders, customer_details)
-
-                    if response.status_code in [200, 201]:
-                        # Update order status in DB
-                        for order in orders:
-                            update_order_status(order["id"], "confirmed")
-
-                        send_instagram_message(
-                            sender_id,
-                            f"✅ Your order has been confirmed and delivery created!\n"
-                            f"Total: Rs {total_amount}\n"
-                            f"Name: {name}, Address: {address}, Phone: {phone}"
-                        )
-                    else:
-                        send_instagram_message(sender_id, "❌ Failed to create delivery. Please try again.")
-                    continue
 
                 elif intent == "cancel_order":
                     order = get_pending_orders(sender_id)
@@ -850,34 +1067,93 @@ def handle_instagram_messages():
 
                 else:
                     print(intent)
-                    # try:
+                    # response = "Sorry, I couldn’t process your message right now."
 
-                    #     context = (
-                    #         "You are Silverline's AI intelligent assistant. "
-                    #         "Silverline is a skilled backend developer and AI enthusiast with strong expertise in Python, Django, and Flask. "
-                    #         "They frequently work with MySQL databases, REST APIs, and deployment setups using Nginx and Eventlet. "
-                    #         "They also integrate advanced AI/ML features such as YOLO-based computer vision, sales forecasting, and QR code automation. "
-                    #         "Silverline’s projects often involve practical business systems — including canteen billing, loyalty rewards, and inventory management. "
-                    #         "They prefer efficient, accurate, and production-ready code solutions over long theoretical explanations. "
-                    #         "Silverline typically works from 10 AM to 7 PM Nepal time, sometimes extending into the night for debugging or deep technical work. "
-                    #         "They are detail-oriented, performance-focused, and like step-by-step improvements rather than full rewrites. "
-                    #         "Your goal as their AI assistant is to act as an intelligent technical co-developer — helping design, debug, optimize, "
-                    #         "and explain backend logic, database queries, and AI integrations clearly and professionally."
-                    #         "You help users with order status and general inquiries."
-                    #         "You can also show products."
+                    # send_instagram_message(sender_id, response)
+                    print("💬 LLM failed → Applying fuzzy fallback matching...")
 
-                    #     )
+                    # Fetch categories if not already fetched
+                    all_categories = fetch_all_categories()  # <-- your existing function
 
-                    #     # The user's message becomes the 'question'
-                    #     response = query_ollama(context, text)
+                    matched_categories, matched_products = fallback_category_match(text_lower, all_categories)
 
-                    # except Exception as e:
-                    #     print("⚠️ Ollama error:", e)
-                    response = "Sorry, I couldn’t process your message right now."
+                    # If nothing matched → truly no idea, return default
+                    if not matched_categories and not matched_products:
+                        send_instagram_message(sender_id, "I couldn't recognize the category. Please try with a different name 🙏")
+                        return {"status": "ok"}
 
-                    send_instagram_message(sender_id, response)
+                    # # If we got matched categories → show category quick replies (same UI as before)
+                    # if matched_categories:
+                    #     quick_replies = [{
+                    #         "content_type": "text",
+                    #         "title": cat['title'][:20],
+                    #         "payload": f"CATEGORY_{cat['title'].upper().replace(' ', '_')}"
+                    #     } for cat in matched_categories[:13]]
 
-    return jsonify({"status": "received"}), 200
+                    #     payload = {
+                    #         "recipient": {"id": sender_id},
+                    #         "message": {
+                    #             "text": "Please select a category 👇",
+                    #             "quick_replies": quick_replies
+                    #         }
+                    #     }
+
+                    #     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+                    #     requests.post(GRAPH_API_URL, headers=headers, json=payload)
+                    #     return {"status": "ok"}
+
+                    # If we got matched categories → directly show products of the best matched category
+                    if matched_categories:
+                        best_category = matched_categories[0]   # pick the top matched category
+                        category_products = best_category.get("products", [])
+
+
+                        print("I sent that category")
+                        if category_products:
+                            send_instagram_carousel_initial(sender_id, category_products)
+                            return {"status": "ok"}
+                        else:
+                            send_instagram_message(sender_id, "This category has no products right now 🙏")
+                            return {"status": "ok"}
+
+                    # # If only products matched → send product carousel (same UI as before)
+                    # if matched_products:
+                    #     send_instagram_carousel_initial(sender_id, matched_products)
+                    #     # You already do this in show_products for state:
+                    #     PRODUCTS = {p['title'].lower(): p for p in matched_products}
+                    #     return {"status": "ok"}
+
+
+                    # If only products matched → send quick replies
+                    if matched_products:
+                        # Take top N products (say 5)
+                        top_products = matched_products[:5]
+
+                        quick_replies = []
+                        for p in top_products:
+                            product_title = p['title']
+                            quick_replies.append({
+                                "content_type": "text",
+                                "title": product_title[:20],  # Instagram limit
+                                "payload": f"PRODUCT_{product_title.upper().replace(' ', '_')}"
+                            })
+
+                        payload = {
+                            "recipient": {"id": sender_id},
+                            "message": {
+                                "text": f"🤔 We found multiple products similar to '{text_lower}'. Please choose one:",
+                                "quick_replies": quick_replies
+                            }
+                        }
+
+                        headers = {
+                            "Authorization": f"Bearer {ACCESS_TOKEN}",
+                            "Content-Type": "application/json"
+                        }
+                        requests.post(GRAPH_API_URL, headers=headers, json=payload)
+
+
+                        return {"status": "ok"}
 
 
 def send_instagram_message(recipient_id, text):
@@ -936,15 +1212,15 @@ def save_order_to_db(sender_id, product_name):
 #     connection.commit()
 #     cursor.close()
 #     connection.close()
-def save_order_to_db_all(sender_id, product_name, quantity, total_price=0, color=None, size=None, gender=None, style=None, season=None, fit=None ):
+def save_order_to_db_all(sender_id, product_name, quantity, price, total_price=0, color=None, size=None, gender=None, style=None, season=None, fit=None ):
     """Save order details with variant info."""
     connection = get_db_connection()
     cursor = connection.cursor()
     cursor.execute("""
         INSERT INTO orders 
-        (sender_id, product_name, quantity, total_price, status, color, size, gender, style, season, fit)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (sender_id, product_name, quantity, total_price, "pending", color, size, gender, style, season, fit))
+        (sender_id, product_name, quantity, total_price, price, status, color, size, gender, style, season, fit)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (sender_id, product_name, quantity, total_price, price, "pending", color, size, gender, style, season, fit))
     connection.commit()
     cursor.close()
     connection.close()
@@ -1312,6 +1588,7 @@ def create_delivery(orders, customer_details):
             "quantity": quantity,
             "size": size,
             "color": color,
+            "price": total_price
         })
 
     if not delivery_items:
@@ -1348,3 +1625,252 @@ def create_delivery(orders, customer_details):
     headers = {"Content-Type": "application/json"}
     response = requests.post(api_url, headers=headers, json=payload)
     return response, total_amount
+
+
+
+from rapidfuzz import fuzz
+
+MALE_WORDS = {"men", "mens", "man", "male", "gents", "gent"}
+FEMALE_WORDS = {"women", "womens", "woman", "female", "ladies", "lady"}
+
+def fuzzy_category_match(text, all_categories, threshold=80):
+    tokens = set(text.lower().split())
+
+    # Detect gender
+    gender = None
+    if tokens & MALE_WORDS:
+        gender = "male"
+    elif tokens & FEMALE_WORDS:
+        gender = "female"
+
+    # Remove gender words for fuzzy comparison
+    main_query = " ".join(tokens - MALE_WORDS - FEMALE_WORDS)
+
+    matched = []
+    for cat in all_categories:
+        title_tokens = set(cat["title"].lower().split())
+
+        # Gender filter
+        if gender == "male" and not (title_tokens & MALE_WORDS):
+            continue
+        if gender == "female" and not (title_tokens & FEMALE_WORDS):
+            continue
+
+        # Remove gender words from category title for fuzzy match
+        main_title = " ".join(title_tokens - MALE_WORDS - FEMALE_WORDS)
+
+        # Use partial_ratio for minor spelling errors
+        similarity = fuzz.partial_ratio(main_query, main_title)
+        # matched = fuzzy_category_match(text, all_categories)
+        if similarity >= threshold:
+            matched.append(cat)
+
+    return matched
+
+# from rapidfuzz import fuzz
+# import copy
+
+# def fuzzy_match_products(question: str, all_categories: list, threshold: int = 40):
+#     """
+#     Fuzzy match the question against product titles.
+
+#     Returns:
+#         matched_categories: list of categories containing only matched products
+#         matched_products: list of all matched products
+#     """
+#     question_normalized = question.lower()
+#     matched_products = []
+#     matched_categories_dict = {}
+
+#     for cat in all_categories:
+#         matched_prods_in_cat = []
+#         for prod in cat.get("products", []):
+#             title = prod.get("title", "").lower()
+#             similarity = fuzz.partial_ratio(question_normalized, title)
+
+#             print(f"similarity for prodct {title} {similarity}")
+#             if similarity >= threshold:
+#                 matched_prods_in_cat.append(prod)
+#                 matched_products.append(prod)
+
+#         if matched_prods_in_cat:
+#             # Make a copy of the category and replace its products with only matched ones
+#             cat_copy = copy.deepcopy(cat)
+#             cat_copy["products"] = matched_prods_in_cat
+#             matched_categories_dict[cat["id"]] = cat_copy   
+#     print("matched_products_", matched_products)
+#     # matched_categories = list(matched_categories_dict.values())
+#     matched_categories = []
+#     return matched_categories, matched_products
+
+
+from rapidfuzz import fuzz
+import copy
+
+def fuzzy_match_products(question: str, all_categories: list, threshold: int = 40):
+    """
+    Fuzzy match the question against product titles and return sorted matched products by similarity.
+    """
+    question_normalized = question.lower()
+    matched_products = []  # will hold tuples: (similarity, product)
+    matched_categories_dict = {}
+
+    for cat in all_categories:
+        matched_prods_in_cat = []
+
+        for prod in cat.get("products", []):
+            title = prod.get("title", "").lower()
+            similarity = fuzz.partial_ratio(question_normalized, title)
+
+            print(f"similarity for product {title}: {similarity}")
+
+            if similarity >= threshold:
+                # store similarity with product for sorting later
+                prod_with_similarity = copy.deepcopy(prod)
+                prod_with_similarity["similarity_score"] = similarity
+
+                matched_prods_in_cat.append(prod_with_similarity)
+                matched_products.append(prod_with_similarity)
+
+        if matched_prods_in_cat:
+            # Make a copy of the category with only matched & sorted products
+            cat_copy = copy.deepcopy(cat)
+            cat_copy["products"] = sorted(matched_prods_in_cat, key=lambda x: x["similarity_score"], reverse=True)
+            matched_categories_dict[cat["id"]] = cat_copy
+
+    # Sort all matched products globally
+    matched_products = sorted(matched_products, key=lambda x: x["similarity_score"], reverse=True)
+
+    # matched_categories = list(matched_categories_dict.values())
+    matched_categories = []
+    return matched_categories, matched_products
+
+
+def fetch_all_categories():
+    """Safe fetch of categories API; returns list (empty on error)."""
+    try:
+        resp = requests.get("https://vibezdc.silverlinepos.com/api/categories/", timeout=6)
+        if resp.status_code == 200:
+            return resp.json() or []
+    except Exception as e:
+        print(f"[catalog] Failed to fetch categories: {e}")
+    return []
+
+import spacy
+from spacy.matcher import PhraseMatcher
+import re
+
+# Create a blank NLP object for PhraseMatcher
+nlp_pm = spacy.blank("en")
+
+def match_categories_phrasematcher(text, all_categories):
+    """
+    Fallback function to match categories using PhraseMatcher.
+    Handles plurals/singulars by adding variants.
+    """
+    matcher = PhraseMatcher(nlp_pm.vocab, attr="LOWER")  # case-insensitive match
+
+    patterns = []
+    cat_map = {}  # Map pattern text to category dict
+    
+
+    print("text to be compared", text)
+    for cat in all_categories:
+        title = cat.get("title", "").strip()
+        if not title:
+            continue
+
+        # Add original title pattern
+        patterns.append(nlp_pm.make_doc(title))
+        cat_map[title.lower()] = cat
+
+        # Simple plural handling: add 's' and remove trailing 's'
+        if not title.lower().endswith("s"):
+            plural = title + "s"
+            patterns.append(nlp_pm.make_doc(plural))
+            cat_map[plural.lower()] = cat
+        else:
+            singular = title.rstrip("s")
+            patterns.append(nlp_pm.make_doc(singular))
+            cat_map[singular.lower()] = cat
+
+    matcher.add("CATEGORY", patterns)
+
+    doc = nlp_pm(text)
+    matches = matcher(doc)
+    matched_categories = []
+
+    for match_id, start, end in matches:
+        span_text = doc[start:end].text.lower()
+        cat = cat_map.get(span_text)
+        if cat and cat not in matched_categories:
+            matched_categories.append(cat)
+
+    return matched_categories
+
+def fallback_category_match(user_message: str, all_categories: list):
+    """
+    Runs PhraseMatcher → Fuzzy Category → Fuzzy Product fallback chain.
+    Returns:
+        matched_categories (list)
+        matched_products (list)
+    """
+
+    text = user_message.lower()
+
+    # 1) PhraseMatcher
+    try:
+        matched_categories = match_categories_phrasematcher(text, all_categories)
+    except Exception:
+        matched_categories = []
+    print("matched_products_after_phrase category matcher", matched_categories )
+
+    # 2) If PhraseMatcher fails → Fuzzy category match
+    if not matched_categories:
+        try:
+            matched_categories = fuzzy_category_match(text, all_categories, threshold=80)
+        except Exception:
+            matched_categories = []
+
+    matched_products = []
+
+    print("matched_products_after_fuzzy category matcher", matched_categories )
+    # 3) If still nothing → Fuzzy product match
+    if not matched_categories:
+        try:
+            matched_categories, matched_products = fuzzy_match_products(text, all_categories, threshold=40)
+        except Exception:
+            matched_categories, matched_products = [], []
+
+    print("matched_products_after_phrase matcher products", matched_categories )
+
+
+    return matched_categories, matched_products
+
+
+import re
+
+def is_number_only(text):
+    text = text.strip().lower()
+    # number or spelled-out number
+    number_words = {"one":1, "two":2, "three":3, "four":4, "five":5, "six":6, "seven":7, "eight":8, "nine":9}
+    
+    if text.isdigit():
+        return int(text)
+    if text in number_words:
+        return number_words[text]
+    return None
+
+import json
+from decimal import Decimal
+from datetime import datetime
+
+def decimal_default(obj):
+
+    print("for redis obj", obj)
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    # You can add more types here if needed
+    return str(obj)  # fallback for unknown types
