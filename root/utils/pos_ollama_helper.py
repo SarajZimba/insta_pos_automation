@@ -47,59 +47,6 @@ def clean_output(output: str) -> str:
     return output.strip()
 
 from .redis_func import get_conversation_context_with_intent
-# def query_ollama(question, context=""):
-
-#     prompt = (
-#         "You are Silverline's intelligent assistant. Only respond in JSON.\n"
-#         "Extract user's intent: show_products, show_categories, place_order, confirm_order, cancel_order, product_question, small_talk, add_attribute, none.\n"
-#         "If user is ordering, identify ALL products and their quantities.\n"
-#         "For each product, extract variants: color, size, gender, style, season, fit.\n"
-#         "If any info is missing for an item, include it in a list 'missing_slots'.\n"
-#         "For 'confirm_order', extract customer_details: name, address, phone.\n"
-#         "Strict JSON format:\n"
-#         "{\n"
-#         '  "intent": "place_order" | "show_products" | "show_categories" | "confirm_order" | "cancel_order" | "product_question" | "small_talk" | "none",\n'
-#         '  "category_filter": <category name or null>,\n'
-#         '  "order_items": [\n'
-#         '    {\n'
-#         '      "product": "<product_name>",\n'
-#         '      "quantity": <number or null>,\n'
-#         '      "color": "<color or null>",\n'
-#         '      "size": "<size or null>",\n'
-#         '      "gender": "<gender or null>",\n'
-#         '      "style": "<style or null>",\n'
-#         '      "season": "<season or null>",\n'
-#         '      "fit": "<fit or null>",\n'
-#         '      "missing_slots": ["quantity", "size"]\n'
-#         '    } ...\n'
-#         '  ],\n'
-#         '  "customer_details": {"name": "<name or null>", "address": "<address or null>", "phone": "<phone or null>"},\n'
-#         '  "negative_intent": true | false\n'
-#         "}\n"
-#         f"Context: {context}\n"
-#         f"Question: {question}\n"
-#         "Answer (JSON only):"
-#     )
-#     try:
-#         result = subprocess.run(
-#             [OLLAMA_PATH, "run", "llama3.2:3b"],
-#             input=prompt.encode("utf-8"),
-#             capture_output=True,
-#             timeout=60
-#         )
-#         raw_output = result.stdout.decode("utf-8")
-#         output = clean_output(raw_output)
-#         return output
-#     except Exception as e:
-#         print("[Ollama Error]", e)
-#         return json.dumps({
-#             "intent": "none",
-#             "category_filter": None,
-#             "order_items": [],
-#             "customer_details": {"name": None, "address": None, "phone": None, "missing_customer_slots": []},
-#             "negative_intent": False
-#         })
-    
 
 import subprocess
 import json
@@ -128,8 +75,8 @@ def query_ollama(question, context=""):
     """
 
     prompt = (
-        "You are Silverline's intelligent order assistant. Respond in STRICT JSON only — no text outside JSON.\n"
-        "Your job: understand customer messages and extract structured data for an ordering chatbot.\n\n"
+        "You are an intent classifier for an e-commerce chatbot. Respond in STRICT JSON only — no text outside JSON.\n"
+        "Your job: understand customer latest messages and extract structured data for an ordering chatbot.\n\n"
         "INTENTS:\n"
         "1. show_products → user asks to see products.\n"
         "2. show_categories → user asks for category listing.\n"
@@ -140,12 +87,21 @@ def query_ollama(question, context=""):
         "7. small_talk → greetings or unrelated messages.\n"
         "8. add_attribute → user specifies missing attributes (like size/color) after being asked.\n"
         "9. none → when unclear.\n\n"
+        "10. place_quantity → user specifies quantities for products after being asked."
 
+        "🚨 CRITICAL RULE (OVERRIDES EVERYTHING ELSE):\n"
+        "If the user message is ONLY a number OR a spelled-out number,"
+        "AND no product name is mentioned, ALWAYS classify as:\n"
+        "{'intent': 'place_quantity','order_items': [{ 'product': null, 'quantity': <converted_number>, 'missing_slots': [] }]}\n"
+        "Do NOT classify such messages as show_products, show_categories, or anything else.\n"
+        "This rule must always take priority.\n\n"
         "ORDER EXTRACTION RULES:\n"
+        "Never assume quantity is 1 by default"
         "- Treat any user message that mentions a product in the context of wanting it as a 'place_order' intent, even if no explicit word 'order' or quantity is mentioned.\n"
         "- Examples:\n"
-        "  - 'I want momo' → {'product': 'momo', 'quantity': 1}\n"
-        "  - 'I want to order pizza' → {'product': 'pizza', 'quantity': 1}\n"
+        "  -'I want this hat' → product='hat', quantity=0'\n"
+        "  - 'I want momo' → {'product': 'momo', 'quantity': 0}\n"
+        "  - 'I want to order pizza' → {'product': 'pizza', 'quantity': 0}\n"
         "  - 'I want 2 pizzas' → {'product': 'pizza', 'quantity': 2}\n"
         "  - 'Can I have one momo' → {'product': 'momo', 'quantity': 1}\n"
         "- When user says 'I want 2 pizzas and 1 momo', extract both as separate order_items.\n"
@@ -162,12 +118,20 @@ def query_ollama(question, context=""):
         "- Extract any variants: color, size, gender, style, season, fit.\n"
         "- If user misses any details (like size or quantity), include them in 'missing_slots'.\n"
         "- All text fields should be lowercase (except names or addresses in confirm_order).\n"
+        "- Treat any message that contains only a number (like '1', '2', '3') or a number spelled out ('one', 'two', 'three') and no product name as intent='place_quantity'."
+        "- Examples:"
+        "'1' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 1, ...}]}"
+        "'2' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 2, ...}]}"
+        "'3' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 3, ...}]}"
+        "'two' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 2, ...}]}"
+        "'three' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 3, ...}]}"
+        "- If the message contains a product name along with a number, treat it as 'place_order'."
         "- For 'confirm_order', extract name, address, phone from message.\n"
         "- Always ensure valid JSON output — no explanations or text outside the JSON.\n\n"
 
         "STRICT JSON FORMAT:\n"
         "{\n"
-        '  "intent": "place_order" | "show_products" | "show_categories" | "confirm_order" | "cancel_order" | "product_question" | "small_talk" | "add_attribute" | "none",\n'
+        '  "intent": "place_order" | "show_products" | "show_categories" | "confirm_order" | "cancel_order" | "product_question" | "small_talk" | "place_quantity" | "add_attribute" | "none",\n'
         '  "category_filter": "<category or null>",\n'
         '  "order_items": [\n'
         '    {\n'
@@ -192,6 +156,8 @@ def query_ollama(question, context=""):
         f"Context: {context}\n"
         f"User message: {question}\n"
         "Output (JSON only):"
+        "NEVER assume that a number like '1', '2', '3' refers to categories or product list selections."
+        "Always interpret number-only messages as quantity input."
         "Make sure your output ends with a closing curly brace '}' and nothing else."
     )
 
@@ -235,6 +201,153 @@ def query_ollama(question, context=""):
         "customer_details": {"name": None, "address": None, "phone": None},
         "negative_intent": False
     }
+
+
+def query_ollama_confirmation(user_message):
+    """
+    Uses LLaMA to determine if user is confirming (yes) or rejecting (no).
+    Returns:
+        "confirm_yes" | "confirm_no" | "unknown"
+    """
+    prompt = f"""
+You are a chatbot assistant that interprets short user responses for confirmation.
+
+Instructions:
+- Only determine if the user is saying YES or NO.
+- Consider variations like "yes", "yeah", "yess please", "ok", "sure", "yup", "yes confirm" etc. as YES.
+- Consider variations like "no", "nah", "nahi", "cancel", "nope", "dont confirm yet" etc. as NO.
+- If it's unclear, return "unknown".
+- Respond in strict JSON ONLY with one key "intent" and value "confirm_yes", "confirm_no", or "unknown".
+
+User message: "{user_message}"
+
+JSON Response:
+{{ "intent": "<your_value_here>" }}
+    """
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+        raw_output = result.stdout.decode("utf-8").strip()
+        # optional: clean output function
+        output_str = raw_output.split("\n")[-1]  # take last line assuming JSON
+        parsed = json.loads(output_str)
+        return parsed.get("intent", "unknown")
+    except Exception as e:
+        print("[Ollama Error]", e)
+        return "unknown"
+
+# import re
+
+# def query_ollama_quantity(user_message):
+#     """
+#     Uses LLaMA to extract numeric quantity from user's message.
+#     Returns an integer (0 if not clear).
+#     """
+#     prompt = f"""
+# You are an intelligent parser that extracts product quantity from short user messages.
+
+# Instructions:
+# - The user may say a number in digits or words (e.g., "3", "three", "two pieces", "I want five").
+# - Your job is to extract the quantity as a number.
+# - If the quantity is not clear, return 0.
+# - Only return a JSON object with one key "quantity" and its integer value.
+# - Do NOT include any text other than JSON.
+
+# User message: "{user_message}"
+
+# JSON Response:
+# {{ "quantity": <number> }}
+# """
+
+#     try:
+#         result = subprocess.run(
+#             [OLLAMA_PATH, "run", "llama3.2:3b"],
+#             input=prompt.encode("utf-8"),
+#             capture_output=True,
+#             timeout=30
+#         )
+#         raw_output = result.stdout.decode("utf-8").strip()
+
+#         # ✅ Extract JSON using regex
+#         match = re.search(r'\{.*"quantity".*?\}', raw_output)
+#         if not match:
+#             print("[Ollama Quantity Error] Could not find JSON in output:", raw_output)
+#             return 0
+
+#         parsed = json.loads(match.group())
+#         qty = parsed.get("quantity", 0)
+#         return int(qty) if isinstance(qty, (int, float)) else 0
+
+#     except Exception as e:
+#         print("[Ollama Quantity Error]", e)
+#         return 0
+
+def query_ollama_quantity(user_message):
+    """
+    Uses LLaMA to extract numeric quantity from user's message.
+    Returns an integer (0 if not clear).
+    """
+    import json, subprocess
+
+    prompt = f"""
+You are an extremely strict parser that extracts the numeric quantity from a user's message.
+
+Instructions:
+- ONLY return JSON, nothing else. Do NOT include explanations, greetings, or emojis.
+- The JSON must contain exactly one key: "quantity", with an integer value.
+- If the quantity is unclear, return 0.
+- Examples:
+    "I want 3" → {{ "quantity": 3 }}
+    "three pieces" → {{ "quantity": 3 }}
+    "I want four of these" → {{ "quantity": 4 }}
+    "not sure" → {{ "quantity": 0 }}
+- Respond with ONLY one line of JSON, no extra spaces or lines.
+
+User message: "{user_message}"
+
+Respond with ONLY JSON:
+{{ "quantity": <number> }}
+"""
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=60
+        )
+        raw_output = result.stdout.decode("utf-8").strip()
+
+        # 🔹 Extract JSON safely (first { to last })
+        start = raw_output.find("{")
+        end = raw_output.rfind("}") + 1
+        if start == -1 or end == -1:
+            print("[Ollama Quantity Error] No JSON found in output:", raw_output)
+            return 0
+
+        json_str = raw_output[start:end]
+
+        # 🔹 Remove surrounding quotes if any
+        if (json_str.startswith('"') and json_str.endswith('"')) or \
+           (json_str.startswith("'") and json_str.endswith("'")):
+            json_str = json_str[1:-1]
+
+        parsed = json.loads(json_str)
+        qty = parsed.get("quantity", 0)
+        return int(qty) if isinstance(qty, (int, float)) else 0
+
+    except Exception as e:
+        print("[Ollama Quantity Error]", e)
+        return 0
+
+
+
+
 
 def enhanced_query_ollama(question, context=""):
     """Enhanced Ollama query that properly extracts quantities and products from natural language"""
