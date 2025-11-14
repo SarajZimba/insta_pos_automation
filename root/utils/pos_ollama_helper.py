@@ -88,6 +88,7 @@ def query_ollama(question, context=""):
         "8. add_attribute → user specifies missing attributes (like size/color) after being asked.\n"
         "9. none → when unclear.\n\n"
         "10. place_quantity → user specifies quantities for products after being asked."
+        "11. check_out → user wants to checkout his order"
 
         "🚨 CRITICAL RULE (OVERRIDES EVERYTHING ELSE):\n"
         "If the user message is ONLY a number OR a spelled-out number,"
@@ -128,6 +129,20 @@ def query_ollama(question, context=""):
         "- If the message contains a product name along with a number, treat it as 'place_order'."
         "- For 'confirm_order', extract name, address, phone from message.\n"
         "- Always ensure valid JSON output — no explanations or text outside the JSON.\n\n"
+
+        "CHECK_OUT INTENT RULES:\n"
+        "- When the user says anything indicating they want to proceed with their cart or finalize their purchase, classify as 'check_out' intent.\n"
+        "- Example phrases:\n"
+        "  - 'I want to checkout'\n"
+        "  - 'Proceed to checkout'\n"
+        "  - 'I’m ready to pay'\n"
+        "  - 'Proceed to payment'\n"
+        "  - 'Complete my order'\n"
+        "  - 'Finalize my order'\n"
+        "  - 'Let’s finish this order'\n"
+        "- Do not confuse with 'confirm_order' — confirm_order is when the user gives their name, address, or phone.\n"
+        "- check_out is when the user simply expresses intent to proceed with existing cart/order items before giving any details.\n"
+
 
         "STRICT JSON FORMAT:\n"
         "{\n"
@@ -214,7 +229,7 @@ You are a chatbot assistant that interprets short user responses for confirmatio
 
 Instructions:
 - Only determine if the user is saying YES or NO.
-- Consider variations like "yes", "yeah", "yess please", "ok", "sure", "yup", "yes confirm" etc. as YES.
+- Consider variations like "yes", "yeah", "yess please", "ok", "sure", "yup", "yes confirm", "confirm" etc. as YES.
 - Consider variations like "no", "nah", "nahi", "cancel", "nope", "dont confirm yet" etc. as NO.
 - If it's unclear, return "unknown".
 - Respond in strict JSON ONLY with one key "intent" and value "confirm_yes", "confirm_no", or "unknown".
@@ -346,6 +361,283 @@ Respond with ONLY JSON:
         return 0
 
 
+def query_ollama_color(user_message):
+    """
+    Uses Ollama (LLaMA3) to extract color name from user's message.
+    Examples:
+        "I want green" → "green"
+        "maybe blue please" → "blue"
+        "the color I want is white" → "white"
+        "not sure yet" → "unknown"
+    
+    Returns:
+        color (str): Extracted color name in lowercase, or "unknown" if not found.
+    """
+
+    prompt = f"""
+You are a color extractor for an e-commerce chatbot.
+Your task: identify the **color** the user mentioned in their message.
+
+Guidelines:
+- Return only one color name, like "red", "green", "white", etc.
+- If the user says something like "I want green" or "color is blue" → return that color.
+- If no clear color is mentioned → return "unknown".
+- Do NOT include extra words, emojis, or punctuation.
+- Respond in **strict JSON only** with the format below.
+
+User message: "{user_message}"
+
+JSON Response:
+{{ "color": "<color or 'unknown'>" }}
+    """
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+        raw_output = result.stdout.decode("utf-8").strip()
+
+        # Take the last JSON-looking line
+        output_str = raw_output.split("\n")[-1].strip()
+        parsed = json.loads(output_str)
+
+        color = parsed.get("color", "unknown").lower().strip()
+        return color
+    except Exception as e:
+        print("[Ollama Error - query_ollama_color]", e)
+        return "unknown"
+
+
+def query_ollama_size(user_message):
+    """
+    Extracts the size (s, m, l, xl, xxl, xxxl, small, medium, large) from user message.
+    Forces LLaMA to return STRICT JSON only.
+    """
+
+    prompt = f"""
+You are a size extractor for an e-commerce chatbot.
+
+Your rules:
+- Identify the size mentioned in the user's message.
+- Allowed outputs (lowercase only): s, m, l, xl, xxl, xxxl, small, medium, large.
+- If no size is found, output: "unknown".
+- You MUST respond in STRICT JSON only — no explanation, no extra text.
+
+User message: "{user_message}"
+
+Return EXACTLY this JSON format:
+{{
+  "size": "<size>"
+}}
+"""
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+
+        raw_output = result.stdout.decode("utf-8").strip()
+
+        # Because model is STRICT JSON only, last line will always be JSON.
+        parsed = json.loads(raw_output)
+
+        size = parsed.get("size", "unknown").lower().strip()
+        return size
+
+    except Exception as e:
+        print("[Ollama Error - query_ollama_size]", e)
+        return "unknown"
+
+import subprocess
+import json
+import re
+
+OLLAMA_PATH = "/usr/local/bin/ollama"
+
+def query_ollama_name(user_message):
+    """
+    Extracts a person's name from a user message.
+    Uses Ollama (LLaMA3) with examples, and falls back to regex for bare names.
+    
+    Returns:
+        name (str): Extracted name, or "unknown" if not found.
+    """
+
+    # 1️⃣ Ollama prompt with examples, including bare names
+    prompt = f"""
+You are an assistant that extracts a person's full name from text.
+Return only the name mentioned by the user.
+If no name is found, return "unknown".
+Respond in strict JSON format.
+
+Examples:
+- "My name is Ram Khadka"  → {{ "name": "Ram Khadka" }}
+- "Name: Shyam Hamal"      → {{ "name": "Shyam Hamal" }}
+- "I am Kiran Thapa"       → {{ "name": "Kiran Thapa" }}
+- "It's John Doe"           → {{ "name": "John Doe" }}
+- "Just call me Alex"       → {{ "name": "Alex" }}
+- "Sita Thapa"              → {{ "name": "Sita Thapa" }}
+- "Ram Khadka"              → {{ "name": "Ram Khadka" }}
+- "Not sure"                → {{ "name": "unknown" }}
+
+User message: "{user_message}"
+
+JSON Response:
+{{ "name": "<extracted name or 'unknown'>" }}
+"""
+
+    name = "unknown"
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+        raw_output = result.stdout.decode("utf-8").strip()
+
+        # Get last JSON-looking line
+        output_str = raw_output.split("\n")[-1].strip()
+        parsed = json.loads(output_str)
+
+        name = parsed.get("name", "unknown").strip()
+
+    except Exception as e:
+        print("[Ollama Error - query_ollama_name]", e)
+
+    # 2️⃣ Fallback regex if Ollama fails (bare name)
+    if name.lower() == "unknown":
+        user_message_clean = user_message.strip()
+        # Accept 1-3 word names with letters only
+        match = re.fullmatch(r"[A-Za-z]+(?: [A-Za-z]+){0,2}", user_message_clean)
+        if match:
+            name = user_message_clean
+
+    return name
+
+
+def query_ollama_phone(user_message):
+    """
+    Extracts a phone number from user text using Ollama (LLaMA3) with fallback to regex.
+    
+    Returns:
+        phone (str): Extracted phone number, or "unknown" if not found.
+    """
+
+    prompt = f"""
+You are an assistant that extracts a phone number from a sentence.
+Return only the digits of the phone number (include country code if present).
+If no phone number is found, return "unknown".
+Respond in strict JSON format.
+
+Examples:
+- "My number is 9801234567"      → {{ "phone": "9801234567" }}
+- "Phone: +977-9801234567"       → {{ "phone": "+9779801234567" }}
+- "Call me at 980-123-4567"      → {{ "phone": "9801234567" }}
+- "9801234567"                    → {{ "phone": "9801234567" }}
+- "No number"                     → {{ "phone": "unknown" }}
+
+User message: "{user_message}"
+
+JSON Response:
+{{ "phone": "<extracted phone or 'unknown'>" }}
+"""
+
+    phone = "unknown"
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+        raw_output = result.stdout.decode("utf-8").strip()
+
+        # Get last JSON-looking line
+        output_str = raw_output.split("\n")[-1].strip()
+        parsed = json.loads(output_str)
+
+        phone = parsed.get("phone", "unknown").strip()
+
+    except Exception as e:
+        print("[Ollama Error - query_ollama_phone]", e)
+
+    # 2️⃣ Fallback regex for phone numbers if Ollama fails
+    if phone.lower() == "unknown":
+        # Matches numbers like 9801234567, 980-123-4567, +9779801234567
+        match = re.search(r"(\+?\d[\d\s\-]{7,14}\d)", user_message)
+        if match:
+            # Remove spaces and dashes
+            phone = re.sub(r"[^\d+]", "", match.group(0))
+
+    return phone
+
+
+def query_ollama_address(user_message):
+    """
+    Extracts a real-world address/location from the user text.
+    Uses Ollama first, then regex fallback.
+    """
+
+    prompt = f"""
+You are an assistant that extracts the user's address or location.
+Return ONLY the address/location mentioned.
+If no address is found, return "unknown".
+
+Respond in STRICT JSON ONLY.
+
+Examples:
+- "My address is Kuala Lumpur" → {{ "address": "Kuala Lumpur" }}
+- "address: Baneshwor" → {{ "address": "Baneshwor" }}
+- "I live in Pokhara" → {{ "address": "Pokhara" }}
+- "Location is Kathmandu" → {{ "address": "Kathmandu" }}
+- "Place: Lakeside Pokhara" → {{ "address": "Lakeside Pokhara" }}
+- "kathmandu" → {{ "address": "Kathmandu" }}
+- "Just in Lalitpur" → {{ "address": "Lalitpur" }}
+- "unknown" → {{ "address": "unknown" }}
+
+User message: "{user_message}"
+
+JSON Response:
+{{ "address": "<extracted address or 'unknown'>" }}
+"""
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+
+        raw_output = result.stdout.decode().strip()
+        output_str = raw_output.split("\n")[-1].strip()
+
+        parsed = json.loads(output_str)
+        address = parsed.get("address", "unknown").strip()
+
+    except Exception as e:
+        print("[Ollama Error - query_ollama_address]", e)
+        address = "unknown"
+
+    # 🔥 REGEX FALLBACK (handles simple entries like “Kuala Lumpur”)
+    if address.lower() == "unknown":
+        msg = user_message.strip()
+
+        # Accept 1–4 word address phrases (letters only)
+        match = re.fullmatch(r"[A-Za-z]+(?: [A-Za-z]+){0,3}", msg)
+        if match:
+            return msg
+
+    return address
 
 
 
