@@ -53,22 +53,252 @@ import json
 
 OLLAMA_PATH = "/usr/local/bin/ollama"  # change path if needed
 
+# def clean_output(text: str):
+#     """Cleans model output to ensure valid JSON."""
+#     text = text.strip()
+#     if text.startswith("```json"):
+#         text = text.replace("```json", "").replace("```", "")
+#     elif text.startswith("```"):
+#         text = text.replace("```", "")
+#     # Sometimes model outputs extra explanation — remove after JSON
+#     try:
+#         start = text.index("{")
+#         end = text.rindex("}") + 1
+#         return text[start:end]
+#     except Exception:
+#         return text
+
+# def query_ollama(question, context=""):
+#     """
+#     Uses Ollama (LLaMA3) to extract structured intents and entities from user messages.
+#     Handles: place_order, confirm_order, add_attribute, etc.
+#     """
+
+#     prompt = (
+#         "You are an intent classifier for an e-commerce chatbot. Respond in STRICT JSON only — no text outside JSON.\n"
+#         "Your job: understand customer latest messages and extract structured data for an ordering chatbot.\n\n"
+#         "INTENTS:\n"
+#         "1. show_products → user asks to see products.\n"
+#         "2. show_categories → user asks for category listing.\n"
+#         "3. place_order → user orders one or more items.\n"
+#         "4. confirm_order → user confirms with name, address, and phone.\n"
+#         "5. cancel_order → user cancels an order.\n"
+#         "6. product_question → user asks details about a product.\n"
+#         "7. small_talk → greetings or unrelated messages.\n"
+#         "8. add_attribute → user specifies missing attributes (like size/color) after being asked.\n"
+#         "9. none → when unclear.\n\n"
+#         "10. place_quantity → user specifies quantities for products after being asked."
+#         "11. check_out → user wants to checkout his order"
+#         "12. view_cart → user wants to view his cart"
+
+#         "🚨 CRITICAL RULE (OVERRIDES EVERYTHING ELSE):\n"
+#         "If the user message is ONLY a number OR a spelled-out number,"
+#         "AND no product name is mentioned, ALWAYS classify as:\n"
+#         "{'intent': 'place_quantity','order_items': [{ 'product': null, 'quantity': <converted_number>, 'missing_slots': [] }]}\n"
+#         "Do NOT classify such messages as show_products, show_categories, or anything else.\n"
+#         "This rule must always take priority.\n\n"
+#         "ORDER EXTRACTION RULES:\n"
+#         "Never assume quantity is 1 by default"
+#         "- Treat any user message that mentions a product in the context of wanting it as a 'place_order' intent, even if no explicit word 'order' or quantity is mentioned.\n"
+#         "- Examples:\n"
+#         "  -'I want this hat' → product='hat', quantity=0'\n"
+#         "  - 'I want momo' → {'product': 'momo', 'quantity': 0}\n"
+#         "  - 'I want to order pizza' → {'product': 'pizza', 'quantity': 0}\n"
+#         "  - 'I want 2 pizzas' → {'product': 'pizza', 'quantity': 2}\n"
+#         "  - 'Can I have one momo' → {'product': 'momo', 'quantity': 1}\n"
+#         "- When user says 'I want 2 pizzas and 1 momo', extract both as separate order_items.\n"
+#         "- When user says 'onion rings 2', treat as product='onion rings', quantity=2.\n"
+#         "- When user only says something like 'L Golden', 'l golden', 's red', 'm white', 'M White', 'xl Blue', or 'xxxl green', treat this as intent='add_attribute'."
+#         "- Split the message into size and color:"
+#         "- - The first token (like s, m, l, xl, xxl, etc.) is ALWAYS the *size* if it matches these common clothing sizes."
+#         "- The rest of the text (like 'red', 'golden', 'blue') is the *color*."
+#         "- Example mappings:"
+#             "'M red' → size='m', color='red'"
+#             "'L Blue' → size='l', color='blue'"
+#             "'xl golden' → size='xl', color='golden'"
+#             "'xxl white' → size='xxl', color='white'"
+#         "- Extract any variants: color, size, gender, style, season, fit.\n"
+#         "- If user misses any details (like size or quantity), include them in 'missing_slots'.\n"
+#         "- All text fields should be lowercase (except names or addresses in confirm_order).\n"
+#         "- Treat any message that contains only a number (like '1', '2', '3') or a number spelled out ('one', 'two', 'three') and no product name as intent='place_quantity'."
+#         "- Examples:"
+#         "'1' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 1, ...}]}"
+#         "'2' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 2, ...}]}"
+#         "'3' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 3, ...}]}"
+#         "'two' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 2, ...}]}"
+#         "'three' → {'intent': 'place_quantity', 'order_items': [{'product': null, 'quantity': 3, ...}]}"
+#         "- If the message contains a product name along with a number, treat it as 'place_order'."
+#         "- For 'confirm_order', extract name, address, phone from message.\n"
+#         "- Always ensure valid JSON output — no explanations or text outside the JSON.\n\n"
+
+#         "CHECK_OUT INTENT RULES:\n"
+#         "- When the user says anything indicating they want to proceed with their cart or finalize their purchase, classify as 'check_out' intent.\n"
+#         "- Example phrases:\n"
+#         "  - 'I want to checkout'\n"
+#         "  - 'Proceed to checkout'\n"
+#         "  - 'I’m ready to pay'\n"
+#         "  - 'Proceed to payment'\n"
+#         "  - 'Complete my order'\n"
+#         "  - 'Finalize my order'\n"
+#         "  - 'Let’s finish this order'\n"
+#         "- Do not confuse with 'confirm_order' — confirm_order is when the user gives their name, address, or phone.\n"
+#         "- check_out is when the user simply expresses intent to proceed with existing cart/order items before giving any details.\n"
+
+
+#         "VIEW_CART INTENT RULES:\n"
+#         "- When the user says anything indicating they want to view with their cart classify as 'view_cart' intent.\n"
+#         "- Example phrases:\n"
+#         "  - 'I want to view cart'\n"
+#         "  - 'I’m ready to see cart'\n"
+#         "  - 'Show me cart items'\n"
+#         "  - 'Let’s see cart items'\n"
+#         "- view_cart is when the user simply expresses intent to view existing cart/order items.\n"
+
+
+#         "STRICT JSON FORMAT:\n"
+#         "{\n"
+#         '  "intent": "place_order" | "show_products" | "show_categories" | "confirm_order" | "cancel_order" | "product_question" | "small_talk" | "place_quantity" | "add_attribute" | "none",\n'
+#         '  "category_filter": "<category or null>",\n'
+#         '  "order_items": [\n'
+#         '    {\n'
+#         '      "product": "<product_name or null>",\n'
+#         '      "quantity": <number or null>,\n'
+#         '      "color": "<color or null>",\n'
+#         '      "size": "<size or null>",\n'
+#         '      "gender": "<gender or null>",\n'
+#         '      "style": "<style or null>",\n'
+#         '      "season": "<season or null>",\n'
+#         '      "fit": "<fit or null>",\n'
+#         '      "missing_slots": ["quantity", "size", ...]\n'
+#         '    }\n'
+#         '  ],\n'
+#         '  "customer_details": {\n'
+#         '      "name": "<name or null>",\n'
+#         '      "address": "<address or null>",\n'
+#         '      "phone": "<phone or null>"\n'
+#         '  },\n'
+#         '  "negative_intent": true | false\n'
+#         "}\n\n"
+#         f"Context: {context}\n"
+#         f"User message: {question}\n"
+#         "Output (JSON only):"
+#         "NEVER assume that a number like '1', '2', '3' refers to categories or product list selections."
+#         "Always interpret number-only messages as quantity input."
+#         "Make sure your output ends with a closing curly brace '}' and nothing else."
+#     )
+
+#     try:
+#         result = subprocess.run(
+#             [OLLAMA_PATH, "run", "llama3.2:3b"],
+#             input=prompt.encode("utf-8"),
+#             capture_output=True,
+#             timeout=60
+#         )
+
+#         raw_output = result.stdout.decode("utf-8").strip()
+#         output_str = clean_output(raw_output)
+
+#         try:
+#             parsed = json.loads(output_str)
+#         except json.JSONDecodeError:
+#             print("[⚠️ Ollama JSON Decode Error] Raw output:", raw_output)
+#             return {
+#                 "intent": "none",
+#                 "category_filter": None,
+#                 "order_items": [],
+#                 "customer_details": {
+#                     "name": None, "address": None, "phone": None
+#                 },
+#                 "negative_intent": False
+#             }
+
+#         return parsed
+
+#     except subprocess.TimeoutExpired:
+#         print("[⏱️ Ollama Timeout]")
+#     except Exception as e:
+#         print("[Ollama Error]", e)
+
+#     # fallback safe JSON
+#     return {
+#         "intent": "none",
+#         "category_filter": None,
+#         "order_items": [],
+#         "customer_details": {"name": None, "address": None, "phone": None},
+#         "negative_intent": False
+#     }
+
+# def clean_output(text: str):
+#     """Extract only the valid JSON block from the LLaMA output."""
+
+#     import re
+#     import json
+
+#     # Remove code fences if present
+#     text = text.strip()
+#     text = text.replace("```json", "").replace("```", "")
+
+#     # Find all possible { ... } blocks
+#     candidates = re.findall(r"\{.*?\}", text, re.DOTALL)
+
+#     if not candidates:
+#         return text  # Nothing to clean
+
+#     # Try each candidate; return the first valid JSON
+#     for block in candidates:
+#         try:
+#             json.loads(block)
+#             return block  # return perfect block
+#         except:
+#             continue
+
+#     # If none are valid, return the entire cleaned text
+#     return text
+
 def clean_output(text: str):
-    """Cleans model output to ensure valid JSON."""
+    """Clean and extract the most valid JSON from Ollama output."""
+    import re
+    import json
+
     text = text.strip()
-    if text.startswith("```json"):
-        text = text.replace("```json", "").replace("```", "")
-    elif text.startswith("```"):
-        text = text.replace("```", "")
-    # Sometimes model outputs extra explanation — remove after JSON
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    # Extract everything between the FIRST '{' and LAST '}'
     try:
         start = text.index("{")
         end = text.rindex("}") + 1
-        return text[start:end]
-    except Exception:
-        return text
+        json_candidate = text[start:end]
 
-def query_ollama(question, context=""):
+        # 🔥 FIX EXTRA TRAILING BRACES (common Ollama issue)
+        while json_candidate.endswith("}}") and not json_candidate.endswith("}}\""):
+            # Keep removing trailing brace until valid
+            try:
+                json.loads(json_candidate)
+                break
+            except:
+                json_candidate = json_candidate[:-1]
+
+        # Try loading
+        json.loads(json_candidate)
+        return json_candidate
+
+    except Exception:
+        pass
+
+    # Fallback: try all block matches
+    candidates = re.findall(r"\{.*?\}", text, re.DOTALL)
+    for block in candidates:
+        try:
+            json.loads(block)
+            return block
+        except:
+            continue
+
+    return text
+
+
+
+def query_ollama(question, context="", product_titles=None):
     """
     Uses Ollama (LLaMA3) to extract structured intents and entities from user messages.
     Handles: place_order, confirm_order, add_attribute, etc.
@@ -77,6 +307,14 @@ def query_ollama(question, context=""):
     prompt = (
         "You are an intent classifier for an e-commerce chatbot. Respond in STRICT JSON only — no text outside JSON.\n"
         "Your job: understand customer latest messages and extract structured data for an ordering chatbot.\n\n"
+
+        "AVAILABLE_PRODUCTS:\n"
+        f"{product_titles}\n"
+        "RULE: If a user refers to a product that is similar to or close to any product name here, "
+        "use the closest matching product name from AVAILABLE_PRODUCTS.\n"
+        "If no clear match, keep product=null.\n\n"
+
+
         "INTENTS:\n"
         "1. show_products → user asks to see products.\n"
         "2. show_categories → user asks for category listing.\n"
@@ -89,6 +327,8 @@ def query_ollama(question, context=""):
         "9. none → when unclear.\n\n"
         "10. place_quantity → user specifies quantities for products after being asked."
         "11. check_out → user wants to checkout his order"
+        "12. view_cart → user wants to view his cart"
+        "13. view_clearance_sales → user wants to see clearance_sales"
 
         "🚨 CRITICAL RULE (OVERRIDES EVERYTHING ELSE):\n"
         "If the user message is ONLY a number OR a spelled-out number,"
@@ -142,6 +382,27 @@ def query_ollama(question, context=""):
         "  - 'Let’s finish this order'\n"
         "- Do not confuse with 'confirm_order' — confirm_order is when the user gives their name, address, or phone.\n"
         "- check_out is when the user simply expresses intent to proceed with existing cart/order items before giving any details.\n"
+
+
+        "VIEW_CART INTENT RULES:\n"
+        "- When the user says anything indicating they want to view with their cart classify as 'view_cart' intent.\n"
+        "- Example phrases:\n"
+        "  - 'I want to view cart'\n"
+        "  - 'I’m ready to see cart'\n"
+        "  - 'Show me cart items'\n"
+        "  - 'Let’s see cart items'\n"
+        "- view_cart is when the user simply expresses intent to view existing cart/order items.\n"
+
+        "VIEW_CLEARANCE_SALES INTENT RULES:\n"
+        "- When the user says anything indicating they want to view clearance sales or promotional prodcuts classify as 'view_clearance_sales' intent.\n"
+        "- Example phrases:\n"
+        "  - 'I want to see clearance sales'\n"
+        "  - 'Show me clearance sales'\n"
+        "  - 'Show me promotional products'\n"
+        "  - 'Let’s see clearance sales'\n"
+        "  - 'clearance sales'\n"
+        "  - 'promotional_products'\n"
+        "- view_clearance_sales is when the user simply expresses intent to view clearance sales/promotional products.\n"
 
 
         "STRICT JSON FORMAT:\n"
@@ -255,6 +516,72 @@ JSON Response:
     except Exception as e:
         print("[Ollama Error]", e)
         return "unknown"
+    
+def query_ollama_confirmation_order(user_message):
+    """
+    Uses LLaMA to determine if user is confirming (yes/order) or rejecting (no).
+    Returns:
+        "confirm_yes" | "confirm_no" | "unknown"
+    """
+    prompt = f"""
+You are a chatbot assistant that interprets short user responses for confirmation.
+
+TASK:
+Classify the user's message ONLY into one of these:
+- "confirm_yes" → user is confirming or wants to proceed with the order
+- "confirm_no" → user rejects, declines, cancels, or wants to stop
+- "unknown" → cannot determine
+
+YES examples (return "confirm_yes"):
+- yes
+- yeah
+- yup
+- ok go ahead
+- confirm
+- please order
+- yes I want to order
+- I want to order
+- I want to order this
+- place the order
+- yes please proceed
+- ok buy it
+- order it
+- I would like to order
+
+NO examples (return "confirm_no"):
+- no
+- nah
+- nahi
+- stop
+- cancel
+- don't order
+- not now
+- leave it
+
+Respond **ONLY** in JSON like:
+{{ "intent": "confirm_yes" }}
+
+User message: "{user_message}"
+
+JSON Response:
+{{ "intent": "<your_value_here>" }}
+    """
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+        raw_output = result.stdout.decode("utf-8").strip()
+        output_str = raw_output.split("\n")[-1]
+        parsed = json.loads(output_str)
+        return parsed.get("intent", "unknown")
+    except Exception as e:
+        print("[Ollama Error]", e)
+        return "unknown"
+
 
 # import re
 
@@ -369,6 +696,7 @@ def query_ollama_color(user_message):
         "maybe blue please" → "blue"
         "the color I want is white" → "white"
         "not sure yet" → "unknown"
+        "golden" → "golden"
     
     Returns:
         color (str): Extracted color name in lowercase, or "unknown" if not found.
@@ -413,7 +741,7 @@ JSON Response:
 
 def query_ollama_size(user_message):
     """
-    Extracts the size (s, m, l, xl, xxl, xxxl, small, medium, large) from user message.
+    Extracts the size (s, m, l, xl, xxl, xxxl,xlll, small, medium, large) from user message.
     Forces LLaMA to return STRICT JSON only.
     """
 
@@ -422,9 +750,13 @@ You are a size extractor for an e-commerce chatbot.
 
 Your rules:
 - Identify the size mentioned in the user's message.
-- Allowed outputs (lowercase only): s, m, l, xl, xxl, xxxl, small, medium, large.
 - If no size is found, output: "unknown".
 - You MUST respond in STRICT JSON only — no explanation, no extra text.
+
+Examples:
+"I want xlll" → "xlll"
+"maybe xl please" → "xl"
+"the size I want is l" → "l"
 
 User message: "{user_message}"
 
@@ -638,6 +970,91 @@ JSON Response:
             return msg
 
     return address
+
+
+
+def query_ollama_image_text_intent(user_message):
+    """
+    Detects user intent when an image is uploaded + text provided.
+    Intents:
+        - identify_product
+        - ask_color_options
+        - ask_size_options
+        - price_query
+        - order_intent
+        - unknown
+    """
+    prompt = f"""
+You are an AI assistant that determines the user's intent when they upload a product image and send a message.
+
+Possible intents:
+
+1. identify_product  
+   When user is asking what the product is or if you sell it.
+   Example:
+   - "What product is this?"
+   - "Do you have this?"
+   - "Find similar items"
+   - "Which brand is this?"
+
+2. ask_color_options  
+   When user is asking about colors.
+   Example:
+   - "Do you have this in blue?"
+   - "What other colors are available?"
+   - "Show this in red."
+
+3. ask_size_options  
+   When the user wants available sizes.
+   Example:
+   - "What sizes do you have?"
+   - "Is this available in medium?"
+   - "Small or large available?"
+
+4. price_query  
+   When the user asks about cost.
+   Example:
+   - "How much is this?"
+   - "What's the price?"
+   - "Is this on sale?"
+
+5. order_intent  
+   When user wants to buy/ add to cart / place an order.
+   Example:
+   - "Add this to cart"
+   - "I want to order 2 pieces"
+   - "Buy this in size L"
+   - "I want 3 of these in blue"
+   - "I want this"
+
+If not sure, return "unknown".
+
+Respond in STRICT JSON ONLY:
+{{
+  "intent": "<one_of_the_intents>"
+}}
+
+User message:
+"{user_message}"
+"""
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, "run", "llama3.2:3b"],
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=30
+        )
+
+        raw_output = result.stdout.decode("utf-8").strip()
+        output_str = raw_output.split("\n")[-1]  # pick last line (JSON)
+        parsed = json.loads(output_str)
+
+        return parsed.get("intent", "unknown")
+
+    except Exception as e:
+        print("[Ollama Error]", e)
+        return "unknown"
 
 
 
